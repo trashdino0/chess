@@ -33,10 +33,10 @@ Or use a GUI (Cutechess / Arena) that manages the process properly.
 ## Architecture (invariants)
 
 - `Move` = `{from: u8, to: u8, promotion: Option<PieceType>}`. Castling / EP / double-push inferred inside `make_move` — never add flags to `Move`.
-- Board: mailbox (`[Option<Piece>; 64]`), FEN parse/generate, Zobrist hashing (`SplitMix64`), undo stack (`Undo`), 50-move / repetition / insufficient-material draw detection.
-- Movegen: pseudo-legal (`generate_pseudo`) then legal (`generate_legal` via make/unmake + `in_check`). Perft verified against standard positions.
-- Eval (`src/eval.rs`): material + tapered piece-square tables (middlegame/endgame interpolation for King; middgame PST for others), pawn structure (passed/isolated/doubled), rook open/semi-open + 7th-rank bonus, bishop-pair bonus. All terms symmetric; startpos evaluates to `0`.
-- Search (`src/search.rs`): iterative deepening, aspiration windows (from depth 4, with widening on fail-high/low), transposition table (always-replace fixed hash), null-move pruning (depth >=3, not in check, non-pawn material), check extension (capped at depth +1), quiescence with delta pruning (promotions/search-captures only; captures skipped if victim + static_eval + 150 <= alpha), late-move pruning (skip very late quiet non-killer moves near leaves), killer + history move ordering, MVV-LVA capture ordering.
+- Board: mailbox (`[Option<Piece>; 64]`), FEN parse/generate, Zobrist hashing (`SplitMix64`), undo stack (`Undo`), 50-move / repetition (O(1) `hash_counts` map synced in make/unmake) / insufficient-material draw detection.
+- Movegen: pseudo-legal (`generate_pseudo`) then legal (`generate_legal` via make/unmake + `in_check`). Quiescence uses direct capture-only generation (`generate_pseudo_captures`). Perft verified against standard positions.
+- Eval (`src/eval.rs`): material + tapered piece-square tables (middlegame/endgame interpolation for King; middgame PST for others), pawn structure (passed/isolated/doubled, passers scored by king distance to promotion), rook open/semi-open + 7th-rank bonus, N/B/R/Q mobility, pawn-shield king safety (faded out in the endgame), bishop-pair bonus. All terms symmetric (color-mirrored positions negate exactly); startpos evaluates to `0`.
+- Search (`src/search.rs`): iterative deepening, aspiration windows (from depth 4, with widening on fail-high/low), transposition table (depth-preferred replacement), null-move pruning (depth >=3, not in check, non-pawn material), internal iterative reduction (depth >=6, no hash move), check extension (capped at depth +1), quiescence with delta pruning (promotions/search-captures only; captures skipped if victim + static_eval + 150 <= alpha), late-move pruning (skip very late quiet non-killer moves near leaves), killer + countermove + history move ordering, MVV-LVA capture ordering.
 - UCI (`uci.rs`): stdin-reader thread forwards lines over `mpsc`; `go` runs on main thread with periodic `poll()` checking the channel for `stop`/`quit`. `isready` deferred mid-search flushed after `go`.
 
 ## Benchmark / test helpers
@@ -82,7 +82,7 @@ cargo build --release
 
 - Zero external crates by design; no bitboards, no SIMD, no parallel search threads.
 - `generate_legal()` creates a full pseudo-legal vector (`Vec<Move>`), then filters by `in_check()` after `make_move`. This is simple but not the fastest possible.
-- Transposition table uses a simple fixed-size power-of-two array with `always-replace`; no depth replacement or aging.
+- Transposition table uses a simple fixed-size power-of-two array with depth-preferred replacement; no generation aging yet.
 - No opening book, no endgame tablebases, no learning / neural network.
 - Search depth is bounded by `MAX_PLY` (64) and a time/deadline mechanism; `infinite` mode relies on `poll()`.
 - EPD/opening files for cutechess must contain only FEN lines (no `#` comments); `benchmarks/openings.epd` is clean.

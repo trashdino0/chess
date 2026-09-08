@@ -34,9 +34,16 @@ No special flag bits. Castling is inferred in `make_move`: if a `King` moves 2 f
 
 `phase = weight(Pawn=0, Knight/Bishop=1, Rook=2, Queen=4, King=0)`, clamped to `[0, 24]`. At `phase = 24` the position is full-material (all 4 knights, 4 bishops, 4 rooks, 2 queens active); at `phase = 0` only kings remain.
 
-The phase is used for the `King` PST interpolation only; other terms (`PAWN`, `KNIGHT`, etc.) use fixed middlegame tables.
+The phase drives the `King` PST interpolation, the pawn-shield term (`shield_diff * phase / 24`, full middlegame → 0 endgame) and the passer king-distance term (`(24 - phase)` scaling, full endgame → 0 middlegame); other terms (`PAWN`, `KNIGHT`, etc.) use fixed middlegame tables.
 
-### 3.2 Tapered King (`KING_MG` / `KING_EG`)
+### 3.2 Mobility / shield / passer distance
+
+- Mobility (`MOB_KNIGHT/BISHOP/ROOK = 2`, `MOB_QUEEN = 1` cp per pseudo-legal destination, via `movegen::mobility_count`; pawns/kings excluded, owner-perspective signed). Symmetric; startpos contributes 0.
+- Pawn shield (`king_shield`: +8 per own pawn one rank ahead of a home king on the 3 neighboring files, +4 two ranks ahead; kings tracked in `evaluate`'s first pass, no extra scans). Wired `(w - b) * phase / 24`.
+- Passer king distance (inside `pawn_structure` for passers only): `(d_enemy - d_own) * 6 * (24 - phase) / 24` with Chebyshev distances to the promotion square; skipped when a king is missing. Quantifies the "square" rule.
+- `development_bonus` is owner-signed (a developed Black piece scores for Black); `eval_is_color_symmetric` pins exact negation on a color-flipped mirror.
+
+### 3.3 Tapered King (`KING_MG` / `KING_EG`)
 
 ```rust
 fn king_pst(sq, color, phase) -> i32 {
@@ -71,8 +78,9 @@ fn king_pst(sq, color, phase) -> i32 {
 - Futility pruning (`!in_check`, `depth <= 2`, `static_eval.abs() < MATE_BOUND`, `static_eval + margin <= alpha`): skips capture-only quiescence when a quiet move can't recover. Margin = `120` at depth 1, `250` at depth 2.
 - Null-move pruning (`null_ok`, `depth >= 3`, `!in_check`, `ply > 0`, `static_eval >= beta`, `has_non_pawn_material()`): `r = 2 + (depth > 6)`, `sc = -negamax(board, depth - 1 - r, -beta, -beta + 1, ply + 1, false, poll)`. If `sc >= beta` and `sc.abs() < MATE_BOUND`, return `beta` immediately.
 - Late-move pruning (`!is_cap`, `!is_killer`, `!in_check`, `depth <= 2`, `i >= 6 + depth * 6`): skip very late quiets near leaves.
-- Move generation order: hash move (10M) > promotion (900k + victim*10) > captures (MVV-LVA: `1_000_000 + victim*10 - attacker`) > EP (`1_000_000 + pawn - pawn`) > killers (`800_000` / `790_000`) > history score.
-- Killer moves: `killers[ply]` array (`[Option<Move>; 2]`). Only quiet moves (`!cap`, `!ep`, `!promo`) update killers/history.
+- Move generation order: hash move (10M) > promotion (900k + victim*10) > captures (MVV-LVA: `1_000_000 + victim*10 - attacker`) > EP (`1_000_000 + pawn - pawn`) > killers (`800_000` / `790_000`) > countermove (`785_000`, quiet reply to the previous move via `counter[prev.from][prev.to]`, tracked on a per-ply move `stack`) > history score.
+- Killer moves: `killers[ply]` array (`[Option<Move>; 2]`). Only quiet moves (`!cap`, `!ep`, `!promo`) update killers/history/countermove.
+- Internal iterative reduction: `depth -= 1` at `depth >= 6` with no hash move (all node types; seeds the TT for ordering).
 - History aging: `*h = (*h + depth*depth).min(1_000_000)`.
 - `note_cutoff()` updates killers/history for quiet moves; `ply < MAX_PLY` guard prevents overflow.
 - `quiescence()`: `in_check` → all legal moves; else captures + promotions only (`generate_captures()`). Delta pruning skips captures when `victim + stand + 150 <= alpha` (promotions never skipped). `alpha` updated with `stand`; return `alpha` (not `stand`) when no captures improve it.
@@ -84,7 +92,9 @@ fn king_pst(sq, color, phase) -> i32 {
 ## 5. Move generation (`src/movegen.rs`)
 
 - `generate_pseudo()` iterates all squares, generates piece moves, pushes to `Vec<Move>` (capacity `64`).
+- `generate_pseudo_captures()` emits captures/EP/all promotions only (no quiets, no castling); `generate_captures()` legality-checks just that set. (Also fixed an old-filter bug: quiet non-pawn moves landing on the EP square were misclassified as captures.)
 - `generate_legal()` filters pseudo-moves by `make_move` + `!in_check(side)` + `unmake_move`.
+- `mobility_count()` (+ `count_stepper`/`count_slider`) mirrors the generators allocation-free for eval.
 - `perft()` returns `1` at depth `0`, `moves.len()` at depth `1`, recursive `sum` otherwise.
 - Perft correctness verified: `startpos` d1=20, d2=400, d3=8_902, d4=197_281; `kiwipete` d1=48, d2=2_039, d3=97_862; `endgame` d1=14, d2=191, d3=2_812.
 
@@ -108,7 +118,8 @@ fn king_pst(sq, color, phase) -> i32 {
 
 - Zero external crates: no bitboards, no SIMD, no parallel search threads (`-each Threads` accepted and ignored per `setoption`), no neural network.
 - `generate_legal()` creates full pseudo-legal vector (`Vec::with_capacity(64)`) then filters by `in_check()`. Simple but not fastest.
-- Transposition table: fixed-size `Vec<Option<Entry>>`, `mask = (n - 1)`, always-replace (`store()` writes regardless of depth). No aging/replacement strategy.
+- Transposition table: fixed-size `Vec<Option<Entry>>`, `mask = (n - 1)`, depth-preferred replacement (empty slot / key collision / `new.depth >= old.depth`). No generation aging yet.
+- Repetition: `hash_counts` identity-hashed map synced in make/unmake (incl. nulls); `hash_count()` is O(1). `hash_history` retained for debugging.
 - No opening book, no Syzygy tablebase integration, no endgame-specific search extensions beyond the tapered king PST.
 - Search abort: `poll()` checks `nodes & 1023 == 0` and time/deadline; if `poll()` returns `true` or time exceeded, `Err(Abort)` bubbles up through `negamax`, `root_search`, `iterate`, and breaks `loop`, keeping previous iteration's `best`/`score`.
 - `bestmove 0000` only at root stalemate (no legal moves + no check = stalemate; no legal moves + check = mate, `-MATE`).
