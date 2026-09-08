@@ -104,7 +104,12 @@ impl TT {
         if sample == 0 {
             return 0;
         }
-        let used = self.slots.iter().take(sample).filter(|e| e.is_some()).count();
+        let used = self
+            .slots
+            .iter()
+            .take(sample)
+            .filter(|e| e.is_some())
+            .count();
         (used * 1000 / sample) as u32
     }
 
@@ -135,6 +140,7 @@ struct Abort;
 pub struct SearchResult {
     pub best: Option<Move>,
     pub score: i32,
+    pub nodes: u64,
 }
 
 /// Run iterative deepening on `board`, printing UCI `info` lines.
@@ -152,9 +158,9 @@ pub fn search_root(
         history: [[[0; 64]; 64]; 2],
         nodes: 0,
         seldepth: 0,
-        deadline: limits.think_time_ms(board.side).map(|ms| {
-            Instant::now() + Duration::from_millis(ms)
-        }),
+        deadline: limits
+            .think_time_ms(board.side)
+            .map(|ms| Instant::now() + Duration::from_millis(ms)),
         max_depth: limits.max_depth(),
     };
     s.iterate(board, poll)
@@ -186,23 +192,26 @@ impl Searcher<'_> {
         Ok(())
     }
 
-    fn iterate(
-        &mut self,
-        board: &mut Board,
-        poll: &mut dyn FnMut() -> bool,
-    ) -> SearchResult {
+    fn iterate(&mut self, board: &mut Board, poll: &mut dyn FnMut() -> bool) -> SearchResult {
         let start = Instant::now();
         let mut root_moves = generate_legal(board);
         if root_moves.is_empty() {
             // Already mated or stalemated.
-            let score = if board.in_check(board.side) {
-                -MATE
-            } else {
-                0
+            let score = if board.in_check(board.side) { -MATE } else { 0 };
+            return SearchResult {
+                best: None,
+                score,
+                nodes: 0,
             };
-            return SearchResult { best: None, score };
         }
-        order_moves(board, &mut root_moves, None, 0, &self.killers, &self.history);
+        order_moves(
+            board,
+            &mut root_moves,
+            None,
+            0,
+            &self.killers,
+            &self.history,
+        );
 
         let mut best = root_moves[0];
         let mut score = side_eval(board);
@@ -250,7 +259,8 @@ impl Searcher<'_> {
             }
             // Store the root result so PV collection can walk it.
             // (Root ply = 0, so no mate-score adjustment is needed.)
-            self.tt.store(board.hash, Some(best), score, depth, TT_EXACT);
+            self.tt
+                .store(board.hash, Some(best), score, depth, TT_EXACT);
             self.print_info(board, depth, score, &start);
             if score.abs() >= MATE_BOUND {
                 break; // found forced mate; deeper search is pointless
@@ -262,6 +272,7 @@ impl Searcher<'_> {
         SearchResult {
             best: Some(best),
             score,
+            nodes: self.nodes,
         }
     }
 
@@ -450,7 +461,15 @@ impl Searcher<'_> {
             let mut sc;
             if i >= 3 && depth >= 3 && !is_cap && !is_killer && !in_check {
                 let r = if depth >= 6 && i >= 8 { 2 } else { 1 };
-                sc = -self.negamax(board, depth - 1 - r, -alpha - 1, -alpha, ply + 1, true, poll)?;
+                sc = -self.negamax(
+                    board,
+                    depth - 1 - r,
+                    -alpha - 1,
+                    -alpha,
+                    ply + 1,
+                    true,
+                    poll,
+                )?;
                 if sc > alpha {
                     sc = -self.negamax(board, depth - 1, -beta, -alpha, ply + 1, true, poll)?;
                 }
@@ -594,11 +613,7 @@ impl Searcher<'_> {
             format!("cp {score}")
         };
         let pv = collect_pv(board, self.tt, depth as usize);
-        let pv_str = pv
-            .iter()
-            .map(|m| m.to_uci())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let pv_str = pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
         println!(
             "info depth {} seldepth {} score {} nodes {} nps {} time {} hashfull {} pv {}",
             depth,
@@ -663,10 +678,9 @@ fn has_non_pawn_material(board: &Board) -> bool {
         if let Some(p) = board.squares[sq] {
             if p.color == board.side {
                 match p.pt {
-                    PieceType::Knight
-                    | PieceType::Bishop
-                    | PieceType::Rook
-                    | PieceType::Queen => return true,
+                    PieceType::Knight | PieceType::Bishop | PieceType::Rook | PieceType::Queen => {
+                        return true
+                    }
                     _ => {}
                 }
             }

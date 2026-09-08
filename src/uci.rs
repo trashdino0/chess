@@ -8,11 +8,11 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 
 use crate::board::{Board, STARTPOS_FEN};
 use crate::movegen::{generate_legal, perft};
-use crate::search::{Limits, TT, search_root};
+use crate::search::{search_root, Limits, TT};
 use crate::types::Move;
 
 pub const ENGINE_NAME: &str = "Ferrum 1.1";
@@ -157,7 +157,10 @@ fn handle_command(
             flush();
         }
         "perft" => {
-            let depth = parts.next().and_then(|d| d.parse::<u32>().ok()).unwrap_or(4);
+            let depth = parts
+                .next()
+                .and_then(|d| d.parse::<u32>().ok())
+                .unwrap_or(4);
             let t = std::time::Instant::now();
             let n = perft(&mut eng.board, depth);
             println!("perft {depth}: {n} nodes in {:?}", t.elapsed());
@@ -411,31 +414,58 @@ pub fn search_cli(depth: u8, fen: &str) {
     }
 }
 
+/// Fixed bench suite: 10 varied FENs (openings, middlegame tactics,
+/// late middlegame, endgames) at a fixed depth. Reports per-position
+/// nodes/time plus totals, for before/after comparison of search/eval changes.
+pub const BENCH_FENS: [&str; 10] = [
+    STARTPOS_FEN,
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    "r1bqkbnr/pppp1ppp/2n5/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 1 1",
+    "rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2",
+    "r1bqkb1r/pppp1ppp/2n2n2/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
+    "2kr3r/ppp1qppp/2n1pn2/3p4/3P1B2/2P1PN2/PPQ2PPP/R3K2R w KQ - 0 1",
+    "5rk1/pp3ppp/2p2n2/3p4/3P4/2P1PN2/PP3PPP/5RK1 w - - 0 1",
+    "8/5pk1/5p1p/8/8/1P3P1P/5PK1/8 w - - 0 1",
+    "6k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 1",
+];
+
 fn run_bench(eng: &mut Engine, depth: u8) {
     use std::time::Instant;
-    let fens = [
-        STARTPOS_FEN,
-        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-        "r1bqkbnr/pppp1ppp/2n5/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 1 1",
-    ];
     let t = Instant::now();
-    for fen in fens {
+    let mut total_nodes = 0u64;
+    for fen in BENCH_FENS {
         let mut b = Board::from_fen(fen).unwrap();
         let lim = Limits {
             depth: Some(depth),
             ..Default::default()
         };
         let mut no_poll = || false;
+        let pt = Instant::now();
         let res = search_root(&mut b, &mut eng.tt, &lim, &mut no_poll);
+        let dt = pt.elapsed();
+        total_nodes += res.nodes;
         println!(
-            "bench {} -> bestmove {} score {}",
+            "bench {} -> bestmove {} score {} nodes {} time {:?}",
             fen,
-            res.best.map(|m| m.to_uci()).unwrap_or_else(|| "0000".into()),
-            res.score
+            res.best
+                .map(|m| m.to_uci())
+                .unwrap_or_else(|| "0000".into()),
+            res.score,
+            res.nodes,
+            dt
         );
     }
-    println!("bench depth {depth}: {:?} total", t.elapsed());
+    let total = t.elapsed();
+    let nps = if total.as_millis() > 0 {
+        total_nodes * 1000 / total.as_millis() as u64
+    } else {
+        total_nodes
+    };
+    println!(
+        "bench depth {depth}: {total_nodes} nodes in {:?} ({nps} nps) total",
+        total
+    );
     flush();
 }
 

@@ -113,13 +113,7 @@ fn gen_pawn(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) {
     }
 }
 
-fn gen_stepper(
-    board: &Board,
-    sq: u8,
-    side: Color,
-    deltas: &[(i8, i8)],
-    moves: &mut Vec<Move>,
-) {
+fn gen_stepper(board: &Board, sq: u8, side: Color, deltas: &[(i8, i8)], moves: &mut Vec<Move>) {
     let f = file_of(sq) as i8;
     let r = rank_of(sq) as i8;
     for (df, dr) in deltas {
@@ -137,13 +131,7 @@ fn gen_stepper(
     }
 }
 
-fn gen_slider(
-    board: &Board,
-    sq: u8,
-    side: Color,
-    deltas: &[(i8, i8)],
-    moves: &mut Vec<Move>,
-) {
+fn gen_slider(board: &Board, sq: u8, side: Color, deltas: &[(i8, i8)], moves: &mut Vec<Move>) {
     let f = file_of(sq) as i8;
     let r = rank_of(sq) as i8;
     for (df, dr) in deltas {
@@ -168,17 +156,14 @@ fn gen_slider(
 fn gen_castling(board: &Board, side: Color, moves: &mut Vec<Move>) {
     match side {
         Color::White => {
-            if board.squares[E1 as usize]
-                != Some(Piece::new(PieceType::King, Color::White))
-            {
+            if board.squares[E1 as usize] != Some(Piece::new(PieceType::King, Color::White)) {
                 return;
             }
             // Kingside: f1, g1 empty; e1, f1, g1 not attacked.
             if board.castling & WK != 0
                 && board.squares[5].is_none()
                 && board.squares[G1 as usize].is_none()
-                && board.squares[H1 as usize]
-                    == Some(Piece::new(PieceType::Rook, Color::White))
+                && board.squares[H1 as usize] == Some(Piece::new(PieceType::Rook, Color::White))
             {
                 let b = Color::Black;
                 if !board.is_square_attacked(E1, b)
@@ -193,8 +178,7 @@ fn gen_castling(board: &Board, side: Color, moves: &mut Vec<Move>) {
                 && board.squares[3].is_none()
                 && board.squares[C1 as usize].is_none()
                 && board.squares[1].is_none()
-                && board.squares[A1 as usize]
-                    == Some(Piece::new(PieceType::Rook, Color::White))
+                && board.squares[A1 as usize] == Some(Piece::new(PieceType::Rook, Color::White))
             {
                 let b = Color::Black;
                 if !board.is_square_attacked(E1, b)
@@ -206,16 +190,13 @@ fn gen_castling(board: &Board, side: Color, moves: &mut Vec<Move>) {
             }
         }
         Color::Black => {
-            if board.squares[E8 as usize]
-                != Some(Piece::new(PieceType::King, Color::Black))
-            {
+            if board.squares[E8 as usize] != Some(Piece::new(PieceType::King, Color::Black)) {
                 return;
             }
             if board.castling & BK != 0
                 && board.squares[61].is_none()
                 && board.squares[G8 as usize].is_none()
-                && board.squares[H8 as usize]
-                    == Some(Piece::new(PieceType::Rook, Color::Black))
+                && board.squares[H8 as usize] == Some(Piece::new(PieceType::Rook, Color::Black))
             {
                 let w = Color::White;
                 if !board.is_square_attacked(E8, w)
@@ -229,8 +210,7 @@ fn gen_castling(board: &Board, side: Color, moves: &mut Vec<Move>) {
                 && board.squares[59].is_none()
                 && board.squares[C8 as usize].is_none()
                 && board.squares[57].is_none()
-                && board.squares[A8 as usize]
-                    == Some(Piece::new(PieceType::Rook, Color::Black))
+                && board.squares[A8 as usize] == Some(Piece::new(PieceType::Rook, Color::Black))
             {
                 let w = Color::White;
                 if !board.is_square_attacked(E8, w)
@@ -315,6 +295,7 @@ mod tests {
 
     #[test]
     fn kiwipete_perft() {
+        // Published numbers: https://chessprogramming.org/Perft_Results
         let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
         assert_eq!(perft_fen(fen, 1), 48);
         assert_eq!(perft_fen(fen, 2), 2_039);
@@ -322,11 +303,27 @@ mod tests {
     }
 
     #[test]
+    fn kiwipete_perft_4() {
+        // Published d4 = 4_085_603 (regression gate for movegen changes).
+        let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+        assert_eq!(perft_fen(fen, 4), 4_085_603);
+    }
+
+    #[test]
     fn endgame_perft() {
-        // Kiwipete-like EP/castling stress + promotion-heavy position.
+        // Position 3 (EP/castling stress + promotion-heavy).
+        // Published: https://chessprogramming.org/Perft_Results
         let fen = "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1";
         assert_eq!(perft_fen(fen, 1), 14);
         assert_eq!(perft_fen(fen, 2), 191);
         assert_eq!(perft_fen(fen, 3), 2_812);
+    }
+
+    #[test]
+    fn position3_perft_deep() {
+        // Published d4 = 43_238, d5 = 674_624.
+        let fen = "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1";
+        assert_eq!(perft_fen(fen, 4), 43_238);
+        assert_eq!(perft_fen(fen, 5), 674_624);
     }
 }
