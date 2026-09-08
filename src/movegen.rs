@@ -153,6 +153,119 @@ fn gen_slider(board: &Board, sq: u8, side: Color, deltas: &[(i8, i8)], moves: &m
     }
 }
 
+/// Pseudo-legal captures/promotions only (for quiescence): captures,
+/// en-passant captures, and all promotions (including quiet promotion
+/// pushes). Quiet non-promotions and castling are never emitted.
+pub fn generate_pseudo_captures(board: &Board) -> Vec<Move> {
+    let mut moves = Vec::with_capacity(16);
+    let side = board.side;
+    for sq in 0..64u8 {
+        let piece = match board.squares[sq as usize] {
+            Some(p) if p.color == side => p,
+            _ => continue,
+        };
+        match piece.pt {
+            PieceType::Pawn => gen_pawn_captures(board, sq, side, &mut moves),
+            PieceType::Knight => gen_stepper_captures(board, sq, side, &KNIGHT_JUMPS, &mut moves),
+            PieceType::King => gen_stepper_captures(board, sq, side, &KING_STEPS, &mut moves),
+            PieceType::Bishop => gen_slider_captures(board, sq, side, &DIAG, &mut moves),
+            PieceType::Rook => gen_slider_captures(board, sq, side, &ORTH, &mut moves),
+            PieceType::Queen => {
+                gen_slider_captures(board, sq, side, &DIAG, &mut moves);
+                gen_slider_captures(board, sq, side, &ORTH, &mut moves);
+            }
+        }
+    }
+    moves
+}
+
+fn gen_pawn_captures(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) {
+    let f = file_of(sq) as i8;
+    let r = rank_of(sq) as i8;
+    let (dir, promo_rank_next) = match side {
+        Color::White => (1i8, 7i8),
+        Color::Black => (-1i8, 0i8),
+    };
+    let one_r = r + dir;
+    // Quiet promotion push (no capture) is still a "capture" for quiescence.
+    if one_r >= 0 && one_r < 8 {
+        let one = make_sq(f as u8, one_r as u8);
+        if board.squares[one as usize].is_none() && one_r == promo_rank_next {
+            push_pawn_move(moves, sq, one, true);
+        }
+    }
+    // Captures (incl. en passant); promotion handled per target rank.
+    for df in [-1i8, 1i8] {
+        let nf = f + df;
+        let nr = r + dir;
+        if nf < 0 || nf >= 8 || nr < 0 || nr >= 8 {
+            continue;
+        }
+        let to = make_sq(nf as u8, nr as u8);
+        match board.squares[to as usize] {
+            Some(p) if p.color != side => {
+                push_pawn_move(moves, sq, to, nr == promo_rank_next);
+            }
+            _ => {
+                if Some(to) == board.ep {
+                    moves.push(Move::new(sq, to, None));
+                }
+            }
+        }
+    }
+}
+
+fn gen_stepper_captures(
+    board: &Board,
+    sq: u8,
+    side: Color,
+    deltas: &[(i8, i8)],
+    moves: &mut Vec<Move>,
+) {
+    let f = file_of(sq) as i8;
+    let r = rank_of(sq) as i8;
+    for (df, dr) in deltas {
+        let nf = f + df;
+        let nr = r + dr;
+        if nf < 0 || nf >= 8 || nr < 0 || nr >= 8 {
+            continue;
+        }
+        let to = make_sq(nf as u8, nr as u8);
+        match board.squares[to as usize] {
+            Some(p) if p.color != side => moves.push(Move::new(sq, to, None)),
+            _ => {}
+        }
+    }
+}
+
+fn gen_slider_captures(
+    board: &Board,
+    sq: u8,
+    side: Color,
+    deltas: &[(i8, i8)],
+    moves: &mut Vec<Move>,
+) {
+    let f = file_of(sq) as i8;
+    let r = rank_of(sq) as i8;
+    for (df, dr) in deltas {
+        let mut nf = f + df;
+        let mut nr = r + dr;
+        while nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
+            let to = make_sq(nf as u8, nr as u8);
+            match board.squares[to as usize] {
+                None => {}
+                Some(p) if p.color != side => {
+                    moves.push(Move::new(sq, to, None));
+                    break;
+                }
+                _ => break,
+            }
+            nf += df;
+            nr += dr;
+        }
+    }
+}
+
 fn gen_castling(board: &Board, side: Color, moves: &mut Vec<Move>) {
     match side {
         Color::White => {
@@ -242,16 +355,21 @@ pub fn generate_legal(board: &mut Board) -> Vec<Move> {
 }
 
 /// Legal captures (and promotions) for quiescence search.
+/// Generates only capture/EP/promotion pseudos, then legality-checks just
+/// that smaller set (same make/unmake + in_check filter as `generate_legal`).
 pub fn generate_captures(board: &mut Board) -> Vec<Move> {
-    generate_legal(board)
-        .into_iter()
-        .filter(|mv| {
-            mv.promotion.is_some()
-                || board.squares[mv.to as usize].is_some()
-                // EP capture: target square empty but it is the EP square.
-                || Some(mv.to) == board.ep
-        })
-        .collect()
+    let pseudos = generate_pseudo_captures(board);
+    let side = board.side;
+    let mut legal = Vec::with_capacity(pseudos.len());
+    for mv in pseudos {
+        let undo = board.make_move(mv);
+        let ok = !board.in_check(side);
+        board.unmake_move(undo);
+        if ok {
+            legal.push(mv);
+        }
+    }
+    legal
 }
 
 /// Move count test. `board` is restored afterwards.
@@ -325,5 +443,94 @@ mod tests {
         let fen = "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1";
         assert_eq!(perft_fen(fen, 4), 43_238);
         assert_eq!(perft_fen(fen, 5), 674_624);
+    }
+
+    fn sort_moves(moves: &mut [Move]) {
+        moves.sort_by_key(|m| {
+            (
+                m.from,
+                m.to,
+                m.promotion.map(|p| p.idx() as u8).unwrap_or(255),
+            )
+        });
+    }
+
+    #[test]
+    fn captures_match_legal_filter() {
+        // Direct pseudo-capture generation must agree with the old
+        // filter-based definition (legal moves that capture, EP, or promote).
+        let fens = [
+            crate::board::STARTPOS_FEN,
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R b KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 b - - 0 1",
+            "r1bqkbnr/pppp1ppp/2n5/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 1 1",
+            "rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2",
+            "r1bqkb1r/pppp1ppp/2n2n2/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
+            "2kr3r/ppp1qppp/2n1pn2/3p4/3P1B2/2P1PN2/PPQ2PPP/R3K2R w KQ - 0 1",
+            "5rk1/pp3ppp/2p2n2/3p4/3P4/2P1PN2/PP3PPP/5RK1 w - - 0 1",
+            "8/5pk1/5p1p/8/8/1P3P1P/5PK1/8 w - - 0 1",
+            "6k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 1",
+            // En passant available.
+            "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3",
+            "rnbqkbnr/pppp1ppp/8/8/3pP3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 3",
+            // Promotions (quiet + captures).
+            "8/2P2k2/8/8/8/8/5K2/8 w - - 0 1",
+            "3r2k1/2P4p/8/8/8/8/5K2/8 w - - 0 1",
+            "8/5k2/8/8/8/8/2p2K2/8 b - - 0 1",
+            // In check (quiescence searches evasions; captures still defined).
+            "r1bqkbnr/pppp1ppp/2n5/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 1 1",
+            "k7/8/8/8/8/8/1q6/K7 w - - 0 1",
+            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+        ];
+        for fen in fens {
+            let mut b = Board::from_fen(fen).unwrap();
+            let mut direct = generate_captures(&mut b);
+            let mut filtered: Vec<Move> = generate_legal(&mut b)
+                .into_iter()
+                .filter(|mv| {
+                    mv.promotion.is_some()
+                        || b.squares[mv.to as usize].is_some()
+                        // EP capture: pawn moving to the EP square (a quiet
+                        // non-pawn move landing on the EP square, e.g. Bh6
+                        // with EP=h6, is NOT a capture — the old filter
+                        // over-included those; the direct generator drops them).
+                        || (Some(mv.to) == b.ep
+                            && b.squares[mv.from as usize].is_some_and(|p| {
+                                p.pt == PieceType::Pawn && p.color == b.side
+                            }))
+                })
+                .collect();
+            sort_moves(&mut direct);
+            sort_moves(&mut filtered);
+            assert_eq!(direct, filtered, "capture mismatch on {fen}");
+            // And on every child (one ply deeper), to catch EP-square and
+            // promotion edge cases the root set misses.
+            for mv in generate_legal(&mut b) {
+                let undo = b.make_move(mv);
+                let mut direct = generate_captures(&mut b);
+                let mut filtered: Vec<Move> = generate_legal(&mut b)
+                    .into_iter()
+                    .filter(|mv| {
+                        mv.promotion.is_some()
+                            || b.squares[mv.to as usize].is_some()
+                            || (Some(mv.to) == b.ep
+                                && b.squares[mv.from as usize]
+                                    .is_some_and(|p| p.pt == PieceType::Pawn && p.color == b.side))
+                    })
+                    .collect();
+                sort_moves(&mut direct);
+                sort_moves(&mut filtered);
+                assert_eq!(
+                    direct,
+                    filtered,
+                    "child capture mismatch on {} after {}",
+                    b.to_fen(),
+                    mv.to_uci()
+                );
+                b.unmake_move(undo);
+            }
+        }
     }
 }
