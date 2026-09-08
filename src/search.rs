@@ -2,6 +2,8 @@
 //! quiescence, transposition table, null-move pruning, LMR, check extensions,
 //! killer + history move ordering and MVV-LVA capture ordering.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::bitboard::bit;
@@ -64,40 +66,115 @@ impl Limits {
 }
 
 // ---------------------------------------------------------------------------
-// Transposition table (fixed-size hash table, depth-preferred replacement)
+// Transposition table (lock-free shared hash table, depth-preferred repl.)
 // ---------------------------------------------------------------------------
+
+/// Salt mixed into the xor checksum so zeroed slots read as misses: a fresh
+/// slot has key = data = check = 0, but expects `0 ^ 0 ^ SALT != 0`.
+const TT_SALT: u64 = 0x9E3779B97F4A7C15;
 
 #[derive(Copy, Clone)]
 struct Entry {
-    key: u64,
     best: Option<Move>,
     score: i32,
     depth: u8,
     flag: u8,
 }
 
+/// One lock-free slot. A torn cross-thread read fails the xor check and is
+/// treated as a miss — never as garbage data (so no bogus best-moves reach
+/// `make_move`). Single-thread behavior is bit-identical to the old table.
+struct Slot {
+    key: AtomicU64,
+    data: AtomicU64,
+    check: AtomicU64,
+}
+
+/// Pack best/score/depth/flag into 47 bits of `data`: bits 0–15 movecode
+/// (`0` = None, else `1 + (from | to<<6 | promo<<12)` with
+/// `promo = PieceType::idx()+1`, 0 = none), bits 16–36 `(score + 2^20)`
+/// (21 bits; `|score| <= INF = 1M < 2^20`), bits 37–44 depth, 45–46 flag.
+fn pack_tt(best: Option<Move>, score: i32, depth: u8, flag: u8) -> u64 {
+    let movecode: u64 = match best {
+        None => 0,
+        Some(mv) => {
+            let promo = match mv.promotion {
+                None => 0,
+                Some(pt) => pt.idx() as u64 + 1,
+            };
+            1 + (mv.from as u64 | (mv.to as u64) << 6 | promo << 12)
+        }
+    };
+    debug_assert!(movecode < 65536);
+    debug_assert!(score.unsigned_abs() <= INF as u32);
+    let score_field = (score as i64 + (1 << 20)) as u64;
+    debug_assert!(score_field < (1 << 21));
+    movecode | score_field << 16 | (depth as u64) << 37 | ((flag as u64) & 3) << 45
+}
+
+fn unpack_tt(data: u64) -> (Option<Move>, i32, u8, u8) {
+    let best = match (data & 0xFFFF) as u32 {
+        0 => None,
+        c => {
+            let c = c - 1;
+            let promotion = match (c >> 12) & 15 {
+                2 => Some(PieceType::Knight),
+                3 => Some(PieceType::Bishop),
+                4 => Some(PieceType::Rook),
+                5 => Some(PieceType::Queen),
+                // Pawn (1) / King (6) promos are never stored; a torn word
+                // that verifies anyway is astronomically unlikely, but map
+                // it to a quiet move rather than inventing a promotion.
+                _ => None,
+            };
+            Some(Move {
+                from: (c & 63) as u8,
+                to: ((c >> 6) & 63) as u8,
+                promotion,
+            })
+        }
+    };
+    let score = ((data >> 16) & 0x1F_FFFF) as i32 - (1 << 20);
+    let depth = ((data >> 37) & 0xFF) as u8;
+    let flag = ((data >> 45) & 3) as u8;
+    (best, score, depth, flag)
+}
+
+#[derive(Clone)]
 pub struct TT {
-    slots: Vec<Option<Entry>>,
+    slots: Arc<Vec<Slot>>,
     mask: usize,
 }
 
 impl TT {
     pub fn new(mb: usize) -> TT {
         let bytes = (mb.max(1).min(1024) * 1024 * 1024) as u64;
-        // Rough entry size; round slot count down to a power of two.
-        let mut n = (bytes / 32).max(1024);
+        // 24-byte slots; round slot count down to a power of two.
+        let mut n = (bytes / 24).max(1024);
         n = n.next_power_of_two() >> 1;
         if n < 1024 {
             n = 1024;
         }
+        let mut v = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            v.push(Slot {
+                key: AtomicU64::new(0),
+                data: AtomicU64::new(0),
+                check: AtomicU64::new(0),
+            });
+        }
         TT {
-            slots: vec![None; n as usize],
+            slots: Arc::new(v),
             mask: (n as usize) - 1,
         }
     }
 
-    pub fn clear(&mut self) {
-        self.slots.fill(None);
+    pub fn clear(&self) {
+        for s in self.slots.iter() {
+            s.data.store(0, Ordering::Relaxed);
+            s.check.store(0, Ordering::Relaxed);
+            s.key.store(0, Ordering::Relaxed);
+        }
     }
 
     pub fn hashfull(&self) -> u32 {
@@ -105,44 +182,60 @@ impl TT {
         if sample == 0 {
             return 0;
         }
-        let used = self
-            .slots
-            .iter()
-            .take(sample)
-            .filter(|e| e.is_some())
-            .count();
+        let mut used = 0;
+        for s in self.slots.iter().take(sample) {
+            let key = s.key.load(Ordering::Relaxed);
+            let data = s.data.load(Ordering::Relaxed);
+            let check = s.check.load(Ordering::Relaxed);
+            if check == key ^ data ^ TT_SALT {
+                used += 1;
+            }
+        }
         (used * 1000 / sample) as u32
     }
 
     fn probe(&self, key: u64) -> Option<Entry> {
-        match self.slots[(key as usize) & self.mask] {
-            Some(e) if e.key == key => Some(e),
-            _ => None,
+        let s = &self.slots[(key as usize) & self.mask];
+        let sk = s.key.load(Ordering::Acquire);
+        if sk != key {
+            return None;
         }
+        let data = s.data.load(Ordering::Relaxed);
+        let check = s.check.load(Ordering::Relaxed);
+        if check != key ^ data ^ TT_SALT {
+            return None;
+        }
+        let (best, score, depth, flag) = unpack_tt(data);
+        Some(Entry {
+            best,
+            score,
+            depth,
+            flag,
+        })
     }
 
-    fn store(&mut self, key: u64, best: Option<Move>, score: i32, depth: u8, flag: u8) {
-        // Depth-preferred replacement: keep the deeper entry for the same
-        // position so a shallow search can't evict valuable deep results.
-        // Empty slots and key collisions (different position) always store.
-        // (No generation aging yet: a per-search generation byte would mark
-        // the previous move's still-useful entries stale, so age-aware
-        // replacement is left for a later pass.)
-        let idx = (key as usize) & self.mask;
-        let replace = match self.slots[idx] {
-            None => true,
-            Some(e) if e.key != key => true,
-            Some(e) => depth >= e.depth,
-        };
-        if replace {
-            self.slots[idx] = Some(Entry {
-                key,
-                best,
-                score,
-                depth,
-                flag,
-            });
+    fn store(&self, key: u64, best: Option<Move>, score: i32, depth: u8, flag: u8) {
+        let s = &self.slots[(key as usize) & self.mask];
+        if s.key.load(Ordering::Relaxed) == key {
+            // Same position: depth-preferred replacement. An unverified
+            // (torn) triple counts as an empty slot so it never blocks a
+            // fresh store; otherwise keep the deeper entry.
+            let old_data = s.data.load(Ordering::Relaxed);
+            let old_check = s.check.load(Ordering::Relaxed);
+            if old_check == key ^ old_data ^ TT_SALT {
+                let old_depth = ((old_data >> 37) & 0xFF) as u8;
+                if depth < old_depth {
+                    return;
+                }
+            }
         }
+        // Empty slots and key collisions always store. Order: data, check,
+        // key last — a reader that observes the new key (Acquire) also sees
+        // the new data/check, and any torn mix fails the xor check as a miss.
+        let data = pack_tt(best, score, depth, flag);
+        s.data.store(data, Ordering::Relaxed);
+        s.check.store(key ^ data ^ TT_SALT, Ordering::Relaxed);
+        s.key.store(key, Ordering::Release);
     }
 }
 
@@ -163,12 +256,12 @@ pub struct SearchResult {
 /// (used for the UCI `stop` command). Returns best move + score.
 pub fn search_root(
     board: &mut Board,
-    tt: &mut TT,
+    tt: &TT,
     limits: &Limits,
     poll: &mut dyn FnMut() -> bool,
 ) -> SearchResult {
     let mut s = Searcher {
-        tt,
+        tt: tt.clone(),
         killers: [[None; 2]; MAX_PLY + 8],
         history: [[[0; 64]; 64]; 2],
         counter: [[None; 64]; 64],
@@ -183,8 +276,8 @@ pub fn search_root(
     s.iterate(board, poll)
 }
 
-struct Searcher<'a> {
-    tt: &'a mut TT,
+struct Searcher {
+    tt: TT,
     killers: [[Option<Move>; 2]; MAX_PLY + 8],
     history: [[[i32; 64]; 64]; 2],
     /// Countermove table: for the previous move's from/to, the quiet move
@@ -200,7 +293,7 @@ struct Searcher<'a> {
     max_depth: u8,
 }
 
-impl Searcher<'_> {
+impl Searcher {
     fn check_time(&self) -> bool {
         match self.deadline {
             Some(d) => Instant::now() >= d,
@@ -674,7 +767,7 @@ impl Searcher<'_> {
         } else {
             format!("cp {score}")
         };
-        let pv = collect_pv(board, self.tt, depth as usize);
+        let pv = collect_pv(board, &self.tt, depth as usize);
         let pv_str = pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
         println!(
             "info depth {} seldepth {} score {} nodes {} nps {} time {} hashfull {} pv {}",
@@ -796,5 +889,125 @@ fn order_moves(
     scores.sort_by(|a, b| b.0.cmp(&a.0));
     for (i, (_, mv)) in scores.into_iter().enumerate() {
         moves[i] = mv;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_promos() -> Vec<Option<Move>> {
+        let mut v = vec![
+            None,
+            Some(Move::new(0, 0, None)),
+            Some(Move::new(12, 28, None)),
+            Some(Move::new(63, 0, None)),
+        ];
+        for pt in [
+            PieceType::Knight,
+            PieceType::Bishop,
+            PieceType::Rook,
+            PieceType::Queen,
+        ] {
+            v.push(Some(Move::new(52, 60, Some(pt))));
+        }
+        v
+    }
+
+    #[test]
+    fn tt_pack_round_trip() {
+        let scores = [0, 1, -1, 150, -321, MATE - 7, -(MATE - 3), INF, -INF];
+        for best in all_promos() {
+            for &score in &scores {
+                for &depth in &[0u8, 1, 6, 64, 255] {
+                    for &flag in &[TT_EXACT, TT_LOWER, TT_UPPER] {
+                        let (b2, s2, d2, f2) = unpack_tt(pack_tt(best, score, depth, flag));
+                        assert_eq!(b2, best, "move {best:?} score {score}");
+                        assert_eq!(s2, score);
+                        assert_eq!(d2, depth);
+                        assert_eq!(f2, flag);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tt_probe_store_basics() {
+        let tt = TT::new(1);
+        // Zeroed table: everything (including key 0) misses.
+        assert!(tt.probe(12345).is_none());
+        assert!(tt.probe(0).is_none());
+        // A genuine key-0 entry still verifies (SALT is nonzero).
+        let mv = Move::new(12, 28, None);
+        tt.store(0, Some(mv), 33, 4, TT_EXACT);
+        let e = tt.probe(0).expect("key-0 entry must verify");
+        assert_eq!(e.best, Some(mv));
+        assert_eq!(e.score, 33);
+        assert_eq!(e.depth, 4);
+        assert_eq!(e.flag, TT_EXACT);
+        // Missing key misses.
+        assert!(tt.probe(999).is_none());
+        // None best-move round-trips.
+        tt.store(777, None, -50, 2, TT_UPPER);
+        let e = tt.probe(777).expect("stored entry must hit");
+        assert_eq!(e.best, None);
+        assert_eq!(e.score, -50);
+    }
+
+    #[test]
+    fn tt_depth_preferred_and_collision() {
+        let tt = TT::new(1);
+        let n = tt.slots.len() as u64;
+        let m1 = Move::new(8, 16, None);
+        let m2 = Move::new(9, 17, None);
+        // Same key: deeper replaces, shallower does not.
+        tt.store(42, Some(m1), 10, 5, TT_EXACT);
+        tt.store(42, Some(m2), 20, 3, TT_EXACT);
+        assert_eq!(tt.probe(42).unwrap().best, Some(m1));
+        tt.store(42, Some(m2), 20, 7, TT_LOWER);
+        let e = tt.probe(42).unwrap();
+        assert_eq!(
+            (e.best, e.score, e.depth, e.flag),
+            (Some(m2), 20, 7, TT_LOWER)
+        );
+        // Collision (different key, same slot: keys differ by table length).
+        tt.store(1000, Some(m1), 11, 9, TT_EXACT);
+        tt.store(1000 + n, Some(m2), 22, 1, TT_EXACT);
+        assert!(tt.probe(1000).is_none(), "evicted key must miss");
+        assert_eq!(tt.probe(1000 + n).unwrap().best, Some(m2));
+    }
+
+    #[test]
+    fn tt_threaded_smoke() {
+        let tt = TT::new(1);
+        let n = tt.slots.len() as u64;
+        assert!(n > 4000, "test needs distinct slots");
+        std::thread::scope(|s| {
+            for tid in 0..4u64 {
+                let tt = &tt;
+                s.spawn(move || {
+                    for i in 0..1000u64 {
+                        let key = tid * 1000 + i + 1; // distinct slots, nonzero
+                        let mv = Move::new((i & 63) as u8, ((i + 7) & 63) as u8, None);
+                        tt.store(key, Some(mv), i as i32 - 500, 6, TT_EXACT);
+                        // Slots are never shared between writers, so our own
+                        // store must read back coherently even mid-race.
+                        let e = tt.probe(key).expect("own slot must hit");
+                        assert_eq!(e.best, Some(mv));
+                        assert_eq!(e.score, i as i32 - 500);
+                    }
+                });
+            }
+        });
+        // No slot was shared between writers, so every key must hit exactly.
+        for tid in 0..4u64 {
+            for i in 0..1000u64 {
+                let key = tid * 1000 + i + 1;
+                let e = tt.probe(key).expect("undisturbed slot must hit");
+                assert_eq!(e.score, i as i32 - 500);
+                assert_eq!(e.depth, 6);
+            }
+        }
     }
 }

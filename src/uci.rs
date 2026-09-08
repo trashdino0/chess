@@ -362,7 +362,7 @@ fn run_search(
         }
     };
 
-    let res = search_root(&mut eng.board, &mut eng.tt, limits, &mut poll);
+    let res = search_root(&mut eng.board, &eng.tt, limits, &mut poll);
 
     // Flush deferred isready as readyok now (UCI expects prompt reply).
     let mut saw_ready = false;
@@ -407,7 +407,7 @@ pub fn search_cli(depth: u8, fen: &str) {
         ..Default::default()
     };
     let mut no_poll = || false;
-    let res = search_root(&mut eng.board, &mut eng.tt, &lim, &mut no_poll);
+    let res = search_root(&mut eng.board, &eng.tt, &lim, &mut no_poll);
     match res.best {
         Some(mv) => println!("bestmove {} score {}", mv.to_uci(), res.score),
         None => println!("bestmove 0000"),
@@ -442,7 +442,7 @@ fn run_bench(eng: &mut Engine, depth: u8) {
         };
         let mut no_poll = || false;
         let pt = Instant::now();
-        let res = search_root(&mut b, &mut eng.tt, &lim, &mut no_poll);
+        let res = search_root(&mut b, &eng.tt, &lim, &mut no_poll);
         let dt = pt.elapsed();
         total_nodes += res.nodes;
         println!(
