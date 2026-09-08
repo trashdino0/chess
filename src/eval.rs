@@ -272,9 +272,30 @@ fn king_pst(sq: u8, color: Color, phase: i32) -> i32 {
     (mg * phase + eg * (24 - phase)) / 24
 }
 
+/// Chebyshev (king-move) distance between two squares.
+fn chebyshev(a: u8, b: u8) -> i32 {
+    (file_of(a) as i8 - file_of(b) as i8)
+        .abs()
+        .max((rank_of(a) as i8 - rank_of(b) as i8).abs()) as i32
+}
+
+/// Extra endgame weight per square of king-distance difference on a passer.
+const PASSER_KING_W: i32 = 6;
+
 /// Pawn-structure term from the pawn owner's perspective. Pawn locations are
 /// passed as per-file rank bitmasks (`1 << rank`), one entry per file.
-fn pawn_structure(color: Color, r: usize, f: usize, own: &[u8; 8], enemy: &[u8; 8]) -> i32 {
+/// Passed pawns also score king distance to the promotion square (own king
+/// close / enemy king far is good), scaled up in the endgame via `phase`.
+fn pawn_structure(
+    color: Color,
+    r: usize,
+    f: usize,
+    own: &[u8; 8],
+    enemy: &[u8; 8],
+    own_king: Option<u8>,
+    enemy_king: Option<u8>,
+    phase: i32,
+) -> i32 {
     let mut s = 0;
     // Doubled: more than one friendly pawn on this file.
     if own[f].count_ones() > 1 {
@@ -318,6 +339,16 @@ fn pawn_structure(color: Color, r: usize, f: usize, own: &[u8; 8], enemy: &[u8; 
             Color::Black => 7 - r,
         };
         s += PASSED_BONUS[rank_idx];
+        // King distance to the passer: our king near the promotion square
+        // and their king far away is good (the "square" rule, quantified).
+        // Endgame-weighted: full strength with bare kings, gone at phase 24.
+        if let (Some(ok), Some(ek)) = (own_king, enemy_king) {
+            let promo = match color {
+                Color::White => make_sq(f as u8, 7),
+                Color::Black => make_sq(f as u8, 0),
+            };
+            s += (chebyshev(ek, promo) - chebyshev(ok, promo)) * PASSER_KING_W * (24 - phase) / 24;
+        }
     }
     s
 }
@@ -351,7 +382,8 @@ fn rook_bonus(color: Color, r: usize, f: usize, own: &[u8; 8], enemy: &[u8; 8]) 
 /// Static evaluation in centipawns from White's perspective.
 ///
 /// Material + middlegame PSTs, a tapered king table (shelter early, activity
-/// late), pawn structure (passed / isolated / doubled), rooks on open files
+/// late), pawn structure (passed / isolated / doubled, passers scored by king
+/// distance to promotion), rooks on open files
 /// and on the 7th rank, piece mobility (N/B/R/Q pseudo-legal move counts),
 /// king safety (pawn-shield presence, faded out in the endgame),
 /// plus a small bishop-pair bonus. All terms are symmetric, so the startpos
@@ -412,11 +444,11 @@ pub fn evaluate(board: &Board) -> i32 {
         };
         match p.pt {
             PieceType::Pawn => {
-                let (own, enemy) = match p.color {
-                    Color::White => (&white_pawns, &black_pawns),
-                    Color::Black => (&black_pawns, &white_pawns),
+                let (own, enemy, ok, ek) = match p.color {
+                    Color::White => (&white_pawns, &black_pawns, white_king, black_king),
+                    Color::Black => (&black_pawns, &white_pawns, black_king, white_king),
                 };
-                u += pawn_structure(p.color, r, f, own, enemy);
+                u += pawn_structure(p.color, r, f, own, enemy, ok, ek, phase);
             }
             PieceType::Rook => {
                 let (own, enemy) = match p.color {
@@ -551,6 +583,49 @@ mod tests {
         // White's h-pawn traded away: material + shield favor Black.
         let cracked = Board::from_fen("r5k1/5ppp/8/8/8/8/5PP1/R5K1 w - - 0 1").unwrap();
         assert!(evaluate(&cracked) < -50);
+    }
+
+    #[test]
+    fn passer_king_distance_scores() {
+        // White Pe5 on a lone file (isolated -12), Ke2 vs Ke7 (phase 0):
+        // -12 + passed 35 + distance (1 - 6) x 6 x 24/24 = -30  =>  -7.
+        let own = [0u8, 0, 0, 0, 1 << 4, 0, 0, 0];
+        let enemy = [0u8; 8];
+        assert_eq!(
+            pawn_structure(Color::White, 4, 4, &own, &enemy, Some(12), Some(52), 0),
+            -7
+        );
+        // Defender on a6 instead (distance 4): (4 - 6) x 6 = -12  =>  11.
+        assert_eq!(
+            pawn_structure(Color::White, 4, 4, &own, &enemy, Some(12), Some(40), 0),
+            11
+        );
+        // Full middlegame: distance term fades to 0  =>  -12 + 35 = 23.
+        assert_eq!(
+            pawn_structure(Color::White, 4, 4, &own, &enemy, Some(12), Some(52), 24),
+            23
+        );
+        // Missing king: term skipped  =>  23.
+        assert_eq!(
+            pawn_structure(Color::White, 4, 4, &own, &enemy, None, Some(52), 0),
+            23
+        );
+        // Blocked pawn: no passer bonus and no distance term (still
+        // isolated: -12).
+        let enemy_pawn = [0u8, 0, 0, 0, 1 << 5, 0, 0, 0];
+        assert_eq!(
+            pawn_structure(Color::White, 4, 4, &own, &enemy_pawn, Some(12), Some(52), 0),
+            -12
+        );
+    }
+
+    #[test]
+    fn defender_in_square_scores_lower() {
+        // Pe5 + Ke2: defender holding (Ke6, inside the square) evaluates
+        // closer to a draw than the defender outside it (Ka6).
+        let inside = Board::from_fen("8/8/4k3/4P3/8/8/4K3/8 w - - 0 1").unwrap();
+        let outside = Board::from_fen("8/8/k7/4P3/8/8/4K3/8 w - - 0 1").unwrap();
+        assert!(evaluate(&outside) > evaluate(&inside));
     }
 
     #[test]
