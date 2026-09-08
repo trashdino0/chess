@@ -410,6 +410,14 @@ impl Searcher<'_> {
             hash_move = e.best;
         }
 
+        // Internal iterative reduction: with no hash move to order by at
+        // high depth, shave one ply so the search isn't flying blind (the
+        // reduced search still seeds the TT for a re-search). Conservative
+        // and depth-gated; applies at all node types.
+        if hash_move.is_none() && depth >= 6 {
+            depth -= 1;
+        }
+
         // Null-move pruning.
         let static_eval = side_eval(board);
         if null_ok
