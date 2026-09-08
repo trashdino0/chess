@@ -1,14 +1,13 @@
 //! Board representation (per-color/per-piece bitboards plus occupancy),
 //! FEN parsing, make/unmake, attack detection and draw detection.
-//! Zobrist hashing included. (A mailbox `squares` array is still synced
-//! alongside for direct lookup; it is removed in a later 3.1 sub-step.)
+//! Zobrist hashing included.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::OnceLock;
 
 use crate::bitboard::{
-    bishop_attacks, bit, king_attacks, knight_attacks, pawn_attackers, rook_attacks,
+    bishop_attacks, bit, king_attacks, knight_attacks, pawn_attackers, pop_lsb, rook_attacks,
 };
 use crate::types::*;
 
@@ -104,9 +103,8 @@ pub struct Undo {
 
 #[derive(Clone)]
 pub struct Board {
-    pub squares: [Option<Piece>; 64],
-    /// Bitboards indexed `[color][piece]`; the source of truth for attacks
-    /// and (later) move generation. Synced with `squares` on every make.
+    /// Bitboards indexed `[color][piece type]`; the sole piece placement
+    /// store. Everything else (occupancy, hash, history) derives from it.
     pub pieces: [[u64; 6]; 2],
     /// Occupancy per color, and combined. Rebuilt from `pieces` on make.
     pub occ: [u64; 2],
@@ -124,6 +122,36 @@ pub struct Board {
     hash_counts: HashCounts,
 }
 
+impl Board {
+    /// Piece on `sq`, if any (occupancy fast path, then one type scan).
+    pub fn piece_at(&self, sq: u8) -> Option<Piece> {
+        let b = bit(sq);
+        if self.occ_all & b == 0 {
+            return None;
+        }
+        let ci = if self.occ[0] & b != 0 { 0 } else { 1 };
+        let color = if ci == 0 { Color::White } else { Color::Black };
+        let boards = &self.pieces[ci];
+        // PieceType::idx order: Pawn = 0, Knight = 1, Bishop = 2,
+        // Rook = 3, Queen = 4, King = 5.
+        let pt = if boards[0] & b != 0 {
+            PieceType::Pawn
+        } else if boards[1] & b != 0 {
+            PieceType::Knight
+        } else if boards[2] & b != 0 {
+            PieceType::Bishop
+        } else if boards[3] & b != 0 {
+            PieceType::Rook
+        } else if boards[4] & b != 0 {
+            PieceType::Queen
+        } else {
+            debug_assert!(boards[5] & b != 0, "occ set but no piece on {sq}");
+            PieceType::King
+        };
+        Some(Piece { pt, color })
+    }
+}
+
 pub const STARTPOS_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
 impl Board {
@@ -136,7 +164,7 @@ impl Board {
         if parts.len() < 4 {
             return Err(format!("FEN needs at least 4 fields: {fen}"));
         }
-        let mut squares: [Option<Piece>; 64] = [None; 64];
+        let mut pieces: [[u64; 6]; 2] = [[0; 6]; 2];
         let mut rank: i8 = 7;
         let mut file: i8 = 0;
         for ch in parts[0].chars() {
@@ -163,7 +191,8 @@ impl Board {
                     if file >= 8 || rank < 0 {
                         return Err("FEN: square overflow".to_string());
                     }
-                    squares[((rank as u8) * 8 + (file as u8)) as usize] = Some(p);
+                    let sq = (rank as u8) * 8 + (file as u8);
+                    pieces[p.color.idx()][p.pt.idx()] |= bit(sq);
                     file += 1;
                 }
             }
@@ -209,8 +238,7 @@ impl Board {
         };
 
         let mut b = Board {
-            squares,
-            pieces: [[0; 6]; 2],
+            pieces,
             occ: [0; 2],
             occ_all: 0,
             side,
@@ -222,11 +250,6 @@ impl Board {
             hash_history: Vec::new(),
             hash_counts: HashCounts::default(),
         };
-        for sq in 0..64u8 {
-            if let Some(p) = b.squares[sq as usize] {
-                b.pieces[p.color.idx()][p.pt.idx()] |= bit(sq);
-            }
-        }
         b.refresh_occupancy();
         b.hash = b.compute_hash();
         b.hash_history.push(b.hash);
@@ -242,24 +265,16 @@ impl Board {
         self.occ_all = self.occ[0] | self.occ[1];
     }
 
-    /// Debug/test helper: every mailbox square agrees with the bitboards,
-    /// and occupancy matches the piece boards.
+    /// Test helper: occupancy matches the piece boards, and no square is on
+    /// two piece boards at once.
     #[cfg(test)]
-    fn check_bb(&self) {
-        for sq in 0..64u8 {
-            let mut found = None;
-            for c in 0..2 {
-                for pt in 0..6 {
-                    if self.pieces[c][pt] & bit(sq) != 0 {
-                        assert!(found.is_none(), "square {sq} on two boards");
-                        found = Some((c, pt));
-                    }
-                }
-            }
-            let expect = self.squares[sq as usize].map(|p| (p.color.idx(), p.pt.idx()));
-            assert_eq!(found, expect, "bitboard/mailbox mismatch on {sq}");
-        }
+    fn check_occ(&self) {
+        let mut all = 0u64;
         for c in 0..2 {
+            for pt in 0..6 {
+                assert!(all & self.pieces[c][pt] == 0, "square on two boards");
+                all |= self.pieces[c][pt];
+            }
             assert_eq!(
                 self.occ[c],
                 self.pieces[c].iter().fold(0u64, |a, bb| a | bb),
@@ -267,6 +282,7 @@ impl Board {
             );
         }
         assert_eq!(self.occ_all, self.occ[0] | self.occ[1], "occ_all stale");
+        assert_eq!(self.occ_all, all, "occ_all disagrees with pieces");
     }
 
     pub fn to_fen(&self) -> String {
@@ -274,7 +290,7 @@ impl Board {
         for r in (0..8).rev() {
             let mut empty = 0;
             for f in 0..8 {
-                match self.squares[(r * 8 + f) as usize] {
+                match self.piece_at(r * 8 + f) {
                     None => empty += 1,
                     Some(p) => {
                         if empty > 0 {
@@ -327,9 +343,12 @@ impl Board {
     fn compute_hash(&self) -> u64 {
         let t = tables();
         let mut h: u64 = 0;
-        for sq in 0..64 {
-            if let Some(p) = self.squares[sq] {
-                h ^= t.pieces[p.color.idx()][p.pt.idx()][sq];
+        for c in 0..2 {
+            for pt in 0..6 {
+                let mut bb = self.pieces[c][pt];
+                while bb != 0 {
+                    h ^= t.pieces[c][pt][pop_lsb(&mut bb) as usize];
+                }
             }
         }
         if self.side == Color::Black {
@@ -413,13 +432,14 @@ impl Board {
         let mut undo = undo;
 
         let side = self.side;
-        let mover = self.squares[mv.from as usize].expect("make_move: no piece");
+        let si = side.idx();
+        let ei = side.opposite().idx();
+        let mover = self.piece_at(mv.from).expect("make_move: no piece");
         debug_assert_eq!(mover.color, side);
 
         // Detect capture (before moving), including en passant.
-        let is_ep_capture = mover.pt == PieceType::Pawn
-            && Some(mv.to) == self.ep
-            && self.squares[mv.to as usize].is_none();
+        let is_ep_capture =
+            mover.pt == PieceType::Pawn && Some(mv.to) == self.ep && self.occ_all & bit(mv.to) == 0;
         let mut captured_sq = mv.to;
         if is_ep_capture {
             captured_sq = if side == Color::White {
@@ -429,7 +449,7 @@ impl Board {
             };
         }
         undo.captured_sq = captured_sq;
-        undo.captured = self.squares[captured_sq as usize];
+        undo.captured = self.piece_at(captured_sq);
         if is_ep_capture {
             debug_assert!(undo.captured.map_or(false, |p| p.pt == PieceType::Pawn));
         }
@@ -437,70 +457,31 @@ impl Board {
         // Reset EP; set later if double push.
         self.ep = None;
 
-        // Move the piece (handle promotion).
-        self.squares[mv.from as usize] = None;
-        // Remove EP-captured pawn.
-        if is_ep_capture {
-            self.squares[captured_sq as usize] = None;
+        // Move the piece bits (handle promotion).
+        self.pieces[si][mover.pt.idx()] &= !bit(mv.from);
+        if let Some(cap) = undo.captured {
+            self.pieces[ei][cap.pt.idx()] &= !bit(captured_sq);
         }
-        let placed = match mv.promotion {
-            Some(pt) => Piece::new(pt, side),
-            None => mover,
-        };
-        self.squares[mv.to as usize] = Some(placed);
+        let placed_pt = mv.promotion.unwrap_or(mover.pt);
+        self.pieces[si][placed_pt.idx()] |= bit(mv.to);
 
-        // Castling: king moved two squares -> move the rook.
+        // Castling: king moved two squares -> move the rook bits.
         if mover.pt == PieceType::King && (file_of(mv.from) as i8 - file_of(mv.to) as i8).abs() == 2
         {
-            match mv.to {
-                x if x == G1 => {
-                    self.squares[H1 as usize] = None;
-                    self.squares[5] = Some(Piece::new(PieceType::Rook, side));
-                }
-                x if x == C1 => {
-                    self.squares[A1 as usize] = None;
-                    self.squares[3] = Some(Piece::new(PieceType::Rook, side));
-                }
-                x if x == G8 => {
-                    self.squares[H8 as usize] = None;
-                    self.squares[61] = Some(Piece::new(PieceType::Rook, side));
-                }
-                x if x == C8 => {
-                    self.squares[A8 as usize] = None;
-                    self.squares[59] = Some(Piece::new(PieceType::Rook, side));
-                }
-                _ => {}
+            let (rf, rt) = match mv.to {
+                x if x == G1 => (H1, 5),
+                x if x == C1 => (A1, 3),
+                x if x == G8 => (H8, 61),
+                x if x == C8 => (A8, 59),
+                _ => (0, 0),
+            };
+            if rf != rt {
+                let ri = PieceType::Rook.idx();
+                self.pieces[si][ri] &= !bit(rf);
+                self.pieces[si][ri] |= bit(rt);
             }
         }
-
-        // Mirror the piece movement on the bitboards.
-        {
-            let si = side.idx();
-            let ei = side.opposite().idx();
-            self.pieces[si][mover.pt.idx()] &= !bit(mv.from);
-            if let Some(cap) = undo.captured {
-                self.pieces[ei][cap.pt.idx()] &= !bit(captured_sq);
-            }
-            let placed_pt = mv.promotion.unwrap_or(mover.pt);
-            self.pieces[si][placed_pt.idx()] |= bit(mv.to);
-            if mover.pt == PieceType::King
-                && (file_of(mv.from) as i8 - file_of(mv.to) as i8).abs() == 2
-            {
-                let (rf, rt) = match mv.to {
-                    x if x == G1 => (H1, 5),
-                    x if x == C1 => (A1, 3),
-                    x if x == G8 => (H8, 61),
-                    x if x == C8 => (A8, 59),
-                    _ => (0, 0),
-                };
-                if rf != rt {
-                    let ri = PieceType::Rook.idx();
-                    self.pieces[si][ri] &= !bit(rf);
-                    self.pieces[si][ri] |= bit(rt);
-                }
-            }
-            self.refresh_occupancy();
-        }
+        self.refresh_occupancy();
 
         // Pawn double push -> set EP square.
         if mover.pt == PieceType::Pawn && (rank_of(mv.from) as i8 - rank_of(mv.to) as i8).abs() == 2
@@ -549,46 +530,38 @@ impl Board {
         self.half = undo.half;
         self.hash = undo.hash;
 
+        // The piece currently on `to` is what was placed by make_move
+        // (promotion piece or the mover itself).
+        let mover = self.piece_at(mv.to).expect("unmake: no piece");
+
         // Undo castling rook move.
-        let mover = self.squares[mv.to as usize].expect("unmake: no piece");
         if mover.pt == PieceType::King && (file_of(mv.from) as i8 - file_of(mv.to) as i8).abs() == 2
         {
+            let si = self.side.idx();
+            let ri = PieceType::Rook.idx();
             match mv.to {
                 x if x == G1 => {
-                    self.squares[5] = None;
-                    self.squares[H1 as usize] = Some(Piece::new(PieceType::Rook, self.side));
+                    self.pieces[si][ri] &= !bit(5);
+                    self.pieces[si][ri] |= bit(H1);
                 }
                 x if x == C1 => {
-                    self.squares[3] = None;
-                    self.squares[A1 as usize] = Some(Piece::new(PieceType::Rook, self.side));
+                    self.pieces[si][ri] &= !bit(3);
+                    self.pieces[si][ri] |= bit(A1);
                 }
                 x if x == G8 => {
-                    self.squares[61] = None;
-                    self.squares[H8 as usize] = Some(Piece::new(PieceType::Rook, self.side));
+                    self.pieces[si][ri] &= !bit(61);
+                    self.pieces[si][ri] |= bit(H8);
                 }
                 x if x == C8 => {
-                    self.squares[59] = None;
-                    self.squares[A8 as usize] = Some(Piece::new(PieceType::Rook, self.side));
+                    self.pieces[si][ri] &= !bit(59);
+                    self.pieces[si][ri] |= bit(A8);
                 }
                 _ => {}
             }
         }
 
-        // Restore mover (un-promote back to pawn).
-        let orig = if undo.mv.unwrap().promotion.is_some() {
-            Piece::new(PieceType::Pawn, self.side)
-        } else {
-            mover
-        };
-        self.squares[mv.from as usize] = Some(orig);
-        self.squares[mv.to as usize] = None;
-        // Restore captured piece (EP goes on its own square).
-        if let Some(cap) = undo.captured {
-            self.squares[undo.captured_sq as usize] = Some(cap);
-        }
-
-        // Mirror the restoration on the bitboards (`mover`/`orig`/`cap`
-        // above carry the pre-move piece identities).
+        // Restore mover (un-promote back to pawn) and captured piece
+        // (EP goes on its own square).
         {
             let si = self.side.idx();
             let ei = self.side.opposite().idx();
@@ -596,23 +569,12 @@ impl Board {
             if let Some(cap) = undo.captured {
                 self.pieces[ei][cap.pt.idx()] |= bit(undo.captured_sq);
             }
-            self.pieces[si][orig.pt.idx()] |= bit(mv.from);
-            if mover.pt == PieceType::King
-                && (file_of(mv.from) as i8 - file_of(mv.to) as i8).abs() == 2
-            {
-                let (rf, rt) = match mv.to {
-                    x if x == G1 => (5, H1),
-                    x if x == C1 => (3, A1),
-                    x if x == G8 => (61, H8),
-                    x if x == C8 => (59, A8),
-                    _ => (0, 0),
-                };
-                if rf != rt {
-                    let ri = PieceType::Rook.idx();
-                    self.pieces[si][ri] &= !bit(rf);
-                    self.pieces[si][ri] |= bit(rt);
-                }
-            }
+            let orig_pt = if mv.promotion.is_some() {
+                PieceType::Pawn
+            } else {
+                mover.pt
+            };
+            self.pieces[si][orig_pt.idx()] |= bit(mv.from);
             self.refresh_occupancy();
         }
     }
@@ -707,7 +669,7 @@ impl Board {
         for r in (0..8).rev() {
             s.push_str(&format!("{} ", r + 1));
             for f in 0..8 {
-                let c = match self.squares[(r * 8 + f) as usize] {
+                let c = match self.piece_at(r * 8 + f) {
                     None => '.',
                     Some(p) => p.to_char(),
                 };
@@ -760,32 +722,6 @@ mod tests {
     }
 
     #[test]
-    fn bitboards_track_mailbox() {
-        // Walk the perft tree; at every node the bitboards must agree with
-        // the mailbox on all 64 squares (catches make/unmake sync bugs).
-        fn walk(b: &mut Board, depth: u32) {
-            b.check_bb();
-            if depth == 0 {
-                return;
-            }
-            for mv in crate::movegen::generate_legal(b) {
-                let u = b.make_move(mv);
-                walk(b, depth - 1);
-                b.unmake_move(u);
-                b.check_bb();
-            }
-        }
-        for fen in [
-            STARTPOS_FEN,
-            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-        ] {
-            let mut b = Board::from_fen(fen).unwrap();
-            walk(&mut b, 3);
-        }
-    }
-
-    #[test]
     fn make_unmake_round_trips_state() {
         // Sequence covering captures, a null move, castling (rights change)
         // and plain quiets; moves come from the legal set so the sequence
@@ -801,19 +737,20 @@ mod tests {
             b.hash_history.len(),
             b.hash_counts.len(),
         );
+        let occ0 = b.occ_all.count_ones();
         let mut undos = Vec::new();
         // A capture and its reply (victim present on the target square).
         for _ in 0..2 {
             let cap = generate_legal(&mut b)
                 .into_iter()
-                .find(|m| b.squares[m.to as usize].is_some())
+                .find(|m| b.piece_at(m.to).is_some())
                 .unwrap();
             undos.push(b.make_move(cap));
         }
         undos.push(b.make_null());
         // Castling when available (drops rights), else a quiet.
         let castle = generate_legal(&mut b).into_iter().find(|m| {
-            b.squares[m.from as usize].is_some_and(|p| p.pt == PieceType::King)
+            b.piece_at(m.from).is_some_and(|p| p.pt == PieceType::King)
                 && (file_of(m.from) as i8 - file_of(m.to) as i8).abs() == 2
         });
         match castle {
@@ -838,6 +775,9 @@ mod tests {
         assert_eq!(b.hash_count(), count0);
         assert_eq!(b.hash_history.len(), hist0);
         assert_eq!(b.hash_counts.len(), map0);
+        // Occupancy integrity: same pieces before and after.
+        b.check_occ();
+        assert_eq!(b.occ_all.count_ones(), occ0);
 
         // Promotion round-trip.
         let mut p = Board::from_fen("8/2P2k2/8/8/8/8/5K2/8 w - - 0 1").unwrap();

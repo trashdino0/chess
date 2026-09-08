@@ -1,9 +1,19 @@
 //! Static evaluation: material + piece-square tables (white perspective),
 //! plus a small bishop-pair bonus.
 
+use crate::bitboard::pop_lsb;
 use crate::board::Board;
 use crate::movegen::mobility_count;
 use crate::types::*;
+
+const PIECE_TYPES: [PieceType; 6] = [
+    PieceType::Pawn,
+    PieceType::Knight,
+    PieceType::Bishop,
+    PieceType::Rook,
+    PieceType::Queen,
+    PieceType::King,
+];
 
 // PSTs in "rank8-first" order (a8..h1), from White's perspective.
 // Standard Simplified Evaluation Function tables (Tomasz Michniewski).
@@ -184,6 +194,9 @@ fn knight_pst(sq: u8, color: Color, phase: i32) -> i32 {
 /// around the king, one rank ahead (+8) or two ranks ahead (+4, still some
 /// cover). Only while the king is still home (back two ranks); a
 /// centralised endgame king has no shield to speak of. Cheap: 6 probes.
+/// King-square lookup wrapper for tests (`evaluate` uses the tracked square
+/// via `king_shield_sq` directly).
+#[cfg(test)]
 fn king_shield(board: &Board, color: Color) -> i32 {
     match board.king_sq(color) {
         Some(ksq) => king_shield_sq(board, ksq, color),
@@ -211,11 +224,13 @@ fn king_shield_sq(board: &Board, ksq: u8, color: Color) -> i32 {
         // kr is home-ranked, so r1/r2 stay on the board.
         let r1 = (kr + dir) as u8;
         let r2 = (kr + 2 * dir) as u8;
-        if board.squares[make_sq(f as u8, r1) as usize]
+        if board
+            .piece_at(make_sq(f as u8, r1))
             .is_some_and(|p| p.pt == PieceType::Pawn && p.color == color)
         {
             s += 8;
-        } else if board.squares[make_sq(f as u8, r2) as usize]
+        } else if board
+            .piece_at(make_sq(f as u8, r2))
             .is_some_and(|p| p.pt == PieceType::Pawn && p.color == color)
         {
             s += 4;
@@ -230,29 +245,30 @@ fn king_shield_sq(board: &Board, ksq: u8, color: Color) -> i32 {
 /// Black). This is phase-independent (pure mobility/development term).
 fn development_bonus(board: &Board) -> i32 {
     let mut dev = 0i32;
-    for sq in 0..64u8 {
-        let Some(p) = board.squares[sq as usize] else {
-            continue;
-        };
-        if p.pt == PieceType::Knight || p.pt == PieceType::Bishop {
-            let r = rank_of(sq) as usize;
-            let f = file_of(sq) as usize;
-            // Base development: bonus for leaving the starting rank.
-            let on_back = match p.color {
-                Color::White => r == 0, // White starts at rank 1 (r=0)
-                Color::Black => r == 7, // Black starts at rank 8 (r=7)
-            };
-            let mut u = 0;
-            if !on_back {
-                u += 6; // developed minor piece (tuned down from 8)
-            }
-            // Central control bonus.
-            if (3..=4).contains(&f) && (3..=4).contains(&r) {
-                u += 4; // central square (tuned down from 5)
-            }
-            match p.color {
-                Color::White => dev += u,
-                Color::Black => dev -= u,
+    for color in [Color::White, Color::Black] {
+        for pt in [PieceType::Knight, PieceType::Bishop] {
+            let mut bb = board.pieces[color.idx()][pt.idx()];
+            while bb != 0 {
+                let sq = pop_lsb(&mut bb);
+                let r = rank_of(sq) as usize;
+                let f = file_of(sq) as usize;
+                // Base development: bonus for leaving the starting rank.
+                let on_back = match color {
+                    Color::White => r == 0, // White starts at rank 1 (r=0)
+                    Color::Black => r == 7, // Black starts at rank 8 (r=7)
+                };
+                let mut u = 0;
+                if !on_back {
+                    u += 6; // developed minor piece (tuned down from 8)
+                }
+                // Central control bonus.
+                if (3..=4).contains(&f) && (3..=4).contains(&r) {
+                    u += 4; // central square (tuned down from 5)
+                }
+                match color {
+                    Color::White => dev += u,
+                    Color::Black => dev -= u,
+                }
             }
         }
     }
@@ -396,20 +412,24 @@ pub fn evaluate(board: &Board) -> i32 {
     let mut black_pawns = [0u8; 8];
     let mut white_king = None;
     let mut black_king = None;
-    for sq in 0..64u8 {
-        if let Some(p) = board.squares[sq as usize] {
-            phase += phase_weight(p.pt);
-            if p.pt == PieceType::Pawn {
-                let f = file_of(sq) as usize;
-                let r = rank_of(sq) as usize;
-                match p.color {
-                    Color::White => white_pawns[f] |= 1 << r,
-                    Color::Black => black_pawns[f] |= 1 << r,
-                }
-            } else if p.pt == PieceType::King {
-                match p.color {
-                    Color::White => white_king = Some(sq),
-                    Color::Black => black_king = Some(sq),
+    for color in [Color::White, Color::Black] {
+        for pt in PIECE_TYPES {
+            let mut bb = board.pieces[color.idx()][pt.idx()];
+            while bb != 0 {
+                let sq = pop_lsb(&mut bb);
+                phase += phase_weight(pt);
+                if pt == PieceType::Pawn {
+                    let f = file_of(sq) as usize;
+                    let r = rank_of(sq) as usize;
+                    match color {
+                        Color::White => white_pawns[f] |= 1 << r,
+                        Color::Black => black_pawns[f] |= 1 << r,
+                    }
+                } else if pt == PieceType::King {
+                    match color {
+                        Color::White => white_king = Some(sq),
+                        Color::Black => black_king = Some(sq),
+                    }
                 }
             }
         }
@@ -419,59 +439,62 @@ pub fn evaluate(board: &Board) -> i32 {
     let mut score = 0i32;
     let mut white_bishops = 0;
     let mut black_bishops = 0;
-    for sq in 0..64u8 {
-        let Some(p) = board.squares[sq as usize] else {
-            continue;
-        };
-        // Kings use the tapered table.
-        if p.pt == PieceType::King {
-            let u = king_pst(sq, p.color, phase);
-            match p.color {
-                Color::White => score += u,
-                Color::Black => score -= u,
-            }
-            continue;
-        }
-        let r = rank_of(sq) as usize;
-        let f = file_of(sq) as usize;
-        // Bishop and knight use tapered tables; others use fixed PST.
-        let mut u = if p.pt == PieceType::Bishop {
-            p.pt.value() + bishop_pst(sq, p.color, phase)
-        } else if p.pt == PieceType::Knight {
-            p.pt.value() + knight_pst(sq, p.color, phase)
-        } else {
-            p.pt.value() + pst_own(p.pt, sq, p.color)
-        };
-        match p.pt {
-            PieceType::Pawn => {
-                let (own, enemy, ok, ek) = match p.color {
-                    Color::White => (&white_pawns, &black_pawns, white_king, black_king),
-                    Color::Black => (&black_pawns, &white_pawns, black_king, white_king),
+    for color in [Color::White, Color::Black] {
+        for pt in PIECE_TYPES {
+            let mut bb = board.pieces[color.idx()][pt.idx()];
+            while bb != 0 {
+                let sq = pop_lsb(&mut bb);
+                // Kings use the tapered table.
+                if pt == PieceType::King {
+                    let u = king_pst(sq, color, phase);
+                    match color {
+                        Color::White => score += u,
+                        Color::Black => score -= u,
+                    }
+                    continue;
+                }
+                let r = rank_of(sq) as usize;
+                let f = file_of(sq) as usize;
+                // Bishop and knight use tapered tables; others use fixed PST.
+                let mut u = if pt == PieceType::Bishop {
+                    pt.value() + bishop_pst(sq, color, phase)
+                } else if pt == PieceType::Knight {
+                    pt.value() + knight_pst(sq, color, phase)
+                } else {
+                    pt.value() + pst_own(pt, sq, color)
                 };
-                u += pawn_structure(p.color, r, f, own, enemy, ok, ek, phase);
+                match pt {
+                    PieceType::Pawn => {
+                        let (own, enemy, ok, ek) = match color {
+                            Color::White => (&white_pawns, &black_pawns, white_king, black_king),
+                            Color::Black => (&black_pawns, &white_pawns, black_king, white_king),
+                        };
+                        u += pawn_structure(color, r, f, own, enemy, ok, ek, phase);
+                    }
+                    PieceType::Rook => {
+                        let (own, enemy) = match color {
+                            Color::White => (&white_pawns, &black_pawns),
+                            Color::Black => (&black_pawns, &white_pawns),
+                        };
+                        u += rook_bonus(color, r, f, own, enemy);
+                    }
+                    PieceType::Bishop => match color {
+                        Color::White => white_bishops += 1,
+                        Color::Black => black_bishops += 1,
+                    },
+                    _ => {}
+                }
+                match pt {
+                    PieceType::Knight | PieceType::Bishop | PieceType::Rook | PieceType::Queen => {
+                        u += mobility_weight(pt) * mobility_count(board, sq, color, pt) as i32;
+                    }
+                    _ => {}
+                }
+                match color {
+                    Color::White => score += u,
+                    Color::Black => score -= u,
+                }
             }
-            PieceType::Rook => {
-                let (own, enemy) = match p.color {
-                    Color::White => (&white_pawns, &black_pawns),
-                    Color::Black => (&black_pawns, &white_pawns),
-                };
-                u += rook_bonus(p.color, r, f, own, enemy);
-            }
-            PieceType::Bishop => match p.color {
-                Color::White => white_bishops += 1,
-                Color::Black => black_bishops += 1,
-            },
-            _ => {}
-        }
-        match p.pt {
-            PieceType::Knight | PieceType::Bishop | PieceType::Rook | PieceType::Queen => {
-                u += mobility_weight(p.pt) * mobility_count(board, sq) as i32;
-            }
-            _ => {}
-        }
-        match p.color {
-            Color::White => score += u,
-            Color::Black => score -= u,
         }
     }
     if white_bishops >= 2 {

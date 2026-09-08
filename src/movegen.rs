@@ -189,14 +189,11 @@ fn gen_pawn_captures(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) 
     }
 }
 
-/// Pseudo-legal destination count for one piece, for eval mobility.
+/// Pseudo-legal destination count for one known piece, for eval mobility.
 /// Counts quiet + capture destinations via attack-set popcounts (not
-/// legality-checked). Pawns, kings and empty squares count 0.
-pub fn mobility_count(board: &Board, sq: u8) -> u32 {
-    let (side, pt) = match board.squares[sq as usize] {
-        Some(p) => (p.color, p.pt),
-        None => return 0,
-    };
+/// legality-checked). Callers (eval) iterate piece boards, so the piece is
+/// already identified; pawns/kings are never queried (return 0).
+pub fn mobility_count(board: &Board, sq: u8, side: Color, pt: PieceType) -> u32 {
     let free = !board.occ[side.idx()];
     match pt {
         PieceType::Knight => (knight_attacks(sq) & free).count_ones(),
@@ -381,26 +378,27 @@ mod tests {
 
     #[test]
     fn mobility_counts() {
+        use Color::*;
+        use PieceType::*;
         // Knight d4: 8; knight a1: b3 + c2 = 2.
         let b = Board::from_fen("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1").unwrap();
-        assert_eq!(mobility_count(&b, 27), 8);
+        assert_eq!(mobility_count(&b, 27, White, Knight), 8);
         let b = Board::from_fen("4k3/8/8/8/8/8/8/N3K3 w - - 0 1").unwrap();
-        assert_eq!(mobility_count(&b, 0), 2);
+        assert_eq!(mobility_count(&b, 0, White, Knight), 2);
         // Bishop d4 on an open board: 13; fully blocked by own pawns: 0.
         let b = Board::from_fen("4k3/8/8/8/3B4/8/8/4K3 w - - 0 1").unwrap();
-        assert_eq!(mobility_count(&b, 27), 13);
+        assert_eq!(mobility_count(&b, 27, White, Bishop), 13);
         let b = Board::from_fen("4k3/8/8/2P1P3/3B4/2P1P3/8/4K3 w - - 0 1").unwrap();
-        assert_eq!(mobility_count(&b, 27), 0);
+        assert_eq!(mobility_count(&b, 27, White, Bishop), 0);
         // Rook d4: 14; queen d4: 13 + 14 = 27.
         let b = Board::from_fen("4k3/8/8/8/3R4/8/8/4K3 w - - 0 1").unwrap();
-        assert_eq!(mobility_count(&b, 27), 14);
+        assert_eq!(mobility_count(&b, 27, White, Rook), 14);
         let b = Board::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1").unwrap();
-        assert_eq!(mobility_count(&b, 27), 27);
-        // Pawns, kings and empty squares count 0.
+        assert_eq!(mobility_count(&b, 27, White, Queen), 27);
+        // Pawns and kings count 0.
         let b = Board::new_startpos();
-        assert_eq!(mobility_count(&b, 8), 0); // white a-pawn
-        assert_eq!(mobility_count(&b, 4), 0); // white king
-        assert_eq!(mobility_count(&b, 27), 0); // empty d4
+        assert_eq!(mobility_count(&b, 8, White, Pawn), 0);
+        assert_eq!(mobility_count(&b, 4, White, King), 0);
     }
 
     fn sort_moves(moves: &mut [Move]) {
@@ -449,13 +447,13 @@ mod tests {
                 .into_iter()
                 .filter(|mv| {
                     mv.promotion.is_some()
-                        || b.squares[mv.to as usize].is_some()
+                        || b.piece_at(mv.to).is_some()
                         // EP capture: pawn moving to the EP square (a quiet
                         // non-pawn move landing on the EP square, e.g. Bh6
                         // with EP=h6, is NOT a capture — the old filter
                         // over-included those; the direct generator drops them).
                         || (Some(mv.to) == b.ep
-                            && b.squares[mv.from as usize].is_some_and(|p| {
+                            && b.piece_at(mv.from).is_some_and(|p| {
                                 p.pt == PieceType::Pawn && p.color == b.side
                             }))
                 })
@@ -472,9 +470,9 @@ mod tests {
                     .into_iter()
                     .filter(|mv| {
                         mv.promotion.is_some()
-                            || b.squares[mv.to as usize].is_some()
+                            || b.piece_at(mv.to).is_some()
                             || (Some(mv.to) == b.ep
-                                && b.squares[mv.from as usize]
+                                && b.piece_at(mv.from)
                                     .is_some_and(|p| p.pt == PieceType::Pawn && p.color == b.side))
                     })
                     .collect();

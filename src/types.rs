@@ -102,11 +102,6 @@ pub struct Piece {
 }
 
 impl Piece {
-    #[inline]
-    pub fn new(pt: PieceType, color: Color) -> Piece {
-        Piece { pt, color }
-    }
-
     pub fn from_char(c: char) -> Option<Piece> {
         let pt = PieceType::from_char(c)?;
         let color = if c.is_ascii_uppercase() {
@@ -139,7 +134,11 @@ pub struct Move {
 impl Move {
     #[inline]
     pub fn new(from: u8, to: u8, promotion: Option<PieceType>) -> Move {
-        Move { from, to, promotion }
+        Move {
+            from,
+            to,
+            promotion,
+        }
     }
 
     /// Parse a UCI move string like "e2e4" or "e7e8q".
@@ -151,11 +150,17 @@ impl Move {
         let from = sq_from_name(&s[0..2])?;
         let to = sq_from_name(&s[2..4])?;
         let promotion = if b.len() >= 5 {
-            Some(PieceType::from_promo_char((b[4] as char).to_ascii_lowercase())?)
+            Some(PieceType::from_promo_char(
+                (b[4] as char).to_ascii_lowercase(),
+            )?)
         } else {
             None
         };
-        Some(Move { from, to, promotion })
+        Some(Move {
+            from,
+            to,
+            promotion,
+        })
     }
 
     pub fn to_uci(self) -> String {

@@ -23,9 +23,6 @@ pub fn pop_lsb(bb: &mut u64) -> u8 {
     sq
 }
 
-pub const FILE_A: u64 = 0x0101_0101_0101_0101;
-pub const FILE_H: u64 = 0x8080_8080_8080_8080;
-
 // ---------------------------------------------------------------------------
 // Leaper tables (precomputed once, `OnceLock` like the Zobrist tables)
 // ---------------------------------------------------------------------------
@@ -95,36 +92,6 @@ pub fn king_attacks(sq: u8) -> u64 {
 // ---------------------------------------------------------------------------
 // Pawn attacks
 // ---------------------------------------------------------------------------
-
-/// Squares attacked BY a pawn standing on `sq` (edge-checked).
-pub fn pawn_attacks(sq: u8, side: Color) -> u64 {
-    let f = file_of(sq);
-    let r = rank_of(sq);
-    let mut bb = 0u64;
-    match side {
-        Color::White => {
-            if r < 7 {
-                if f > 0 {
-                    bb |= bit(sq + 7);
-                }
-                if f < 7 {
-                    bb |= bit(sq + 9);
-                }
-            }
-        }
-        Color::Black => {
-            if r > 0 {
-                if f < 7 {
-                    bb |= bit(sq - 7);
-                }
-                if f > 0 {
-                    bb |= bit(sq - 9);
-                }
-            }
-        }
-    }
-    bb
-}
 
 /// Squares a pawn of color `by` would stand on to attack `sq`
 /// (i.e. the reverse of `pawn_attacks`; used for attack detection).
@@ -259,20 +226,6 @@ mod tests {
     #[test]
     fn pawn_attack_edges() {
         use crate::types::sq_from_name;
-        // White a2 attacks b3 only; black h7 attacks g6 only.
-        assert_eq!(
-            pawn_attacks(sq_from_name("a2").unwrap(), Color::White),
-            bit(17)
-        );
-        assert_eq!(
-            pawn_attacks(sq_from_name("h7").unwrap(), Color::Black),
-            bit(46)
-        );
-        // White e2 attacks d3 + f3.
-        assert_eq!(
-            pawn_attacks(sq_from_name("e2").unwrap(), Color::White),
-            bit(19) | bit(21)
-        );
         // Attackers of d4: white from c3/e3, black from c5/e5.
         assert_eq!(
             pawn_attackers(sq_from_name("d4").unwrap(), Color::White),

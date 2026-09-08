@@ -4,6 +4,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::bitboard::bit;
 use crate::board::Board;
 use crate::eval::evaluate;
 use crate::movegen::{generate_captures, generate_legal, generate_pseudo};
@@ -483,7 +484,7 @@ impl Searcher<'_> {
             None
         };
         for (i, &mv) in moves.iter().enumerate() {
-            let is_cap = board.squares[mv.to as usize].is_some()
+            let is_cap = board.occ_all & bit(mv.to) != 0
                 || Some(mv.to) == board.ep
                 || mv.promotion.is_some();
             let is_killer = Some(mv) == killer1 || Some(mv) == killer2;
@@ -641,11 +642,10 @@ impl Searcher<'_> {
 
     fn note_cutoff(&mut self, side: Color, mv: Move, board: &Board, ply: usize, depth: i32) {
         // Only quiet moves update killers/history.
-        let quiet = board.squares[mv.to as usize].is_none()
-            && Some(mv.to) != board.ep
-            && mv.promotion.is_none();
-        // NB: board here is AFTER unmake (position before the move), so
-        // `squares[to]` is the pre-move state. Captures have a victim there.
+        let quiet =
+            board.occ_all & bit(mv.to) == 0 && Some(mv.to) != board.ep && mv.promotion.is_none();
+        // NB: board here is AFTER unmake (position before the move), so the
+        // occupancy at `to` is the pre-move state. Captures have a victim there.
         if !quiet || ply >= MAX_PLY {
             return;
         }
@@ -736,19 +736,12 @@ fn side_eval(board: &Board) -> i32 {
 }
 
 fn has_non_pawn_material(board: &Board) -> bool {
-    for sq in 0..64 {
-        if let Some(p) = board.squares[sq] {
-            if p.color == board.side {
-                match p.pt {
-                    PieceType::Knight | PieceType::Bishop | PieceType::Rook | PieceType::Queen => {
-                        return true
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    false
+    let si = board.side.idx();
+    board.pieces[si][PieceType::Knight.idx()]
+        | board.pieces[si][PieceType::Bishop.idx()]
+        | board.pieces[si][PieceType::Rook.idx()]
+        | board.pieces[si][PieceType::Queen.idx()]
+        != 0
 }
 
 fn order_moves(
@@ -772,14 +765,12 @@ fn order_moves(
                 s = 10_000_000;
             } else if let Some(promo) = mv.promotion {
                 s = 900_000 + promo.value();
-                if board.squares[mv.to as usize].is_some() {
+                if let Some(victim) = board.piece_at(mv.to) {
                     // promotion capture: victim value on top
-                    s += board.squares[mv.to as usize].unwrap().pt.value() * 10;
+                    s += victim.pt.value() * 10;
                 }
-            } else if let Some(victim) = board.squares[mv.to as usize] {
-                let attacker = board.squares[mv.from as usize]
-                    .map(|p| p.pt.value())
-                    .unwrap_or(0);
+            } else if let Some(victim) = board.piece_at(mv.to) {
+                let attacker = board.piece_at(mv.from).map(|p| p.pt.value()).unwrap_or(0);
                 // MVV-LVA: most valuable victim, least valuable attacker.
                 s = 1_000_000 + victim.pt.value() * 10 - attacker;
             } else if Some(mv.to) == board.ep {
