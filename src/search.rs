@@ -170,6 +170,8 @@ pub fn search_root(
         tt,
         killers: [[None; 2]; MAX_PLY + 8],
         history: [[[0; 64]; 64]; 2],
+        counter: [[None; 64]; 64],
+        stack: [None; MAX_PLY + 32],
         nodes: 0,
         seldepth: 0,
         deadline: limits
@@ -184,6 +186,13 @@ struct Searcher<'a> {
     tt: &'a mut TT,
     killers: [[Option<Move>; 2]; MAX_PLY + 8],
     history: [[[i32; 64]; 64]; 2],
+    /// Countermove table: for the previous move's from/to, the quiet move
+    /// that last caused a cutoff in reply.
+    counter: [[Option<Move>; 64]; 64],
+    /// Move stack: `stack[ply]` is the move played from the node at `ply`
+    /// (None for null moves / above the root); sized past MAX_PLY so
+    /// quiescence (capped at MAX_PLY + 24) can index it too.
+    stack: [Option<Move>; MAX_PLY + 32],
     nodes: u64,
     seldepth: u32,
     deadline: Option<Instant>,
@@ -222,9 +231,11 @@ impl Searcher<'_> {
             board,
             &mut root_moves,
             None,
+            None,
             0,
             &self.killers,
             &self.history,
+            &self.counter,
         );
 
         let mut best = root_moves[0];
@@ -302,6 +313,7 @@ impl Searcher<'_> {
         let mut best = moves[0];
         let mut best_score = -INF;
         for (i, &mv) in moves.iter().enumerate() {
+            self.stack[0] = Some(mv);
             let undo = board.make_move(mv);
             let sc = if i == 0 {
                 -self.negamax(board, depth - 1, -beta, -alpha, 1, true, poll)?
@@ -409,6 +421,7 @@ impl Searcher<'_> {
         {
             let r = 2 + (depth > 6) as i32;
             let undo = board.make_null();
+            self.stack[ply] = None; // null move: no countermove info below
             let sc = -self.negamax(board, depth - 1 - r, -beta, -beta + 1, ply + 1, false, poll)?;
             board.unmake_null(undo);
             if sc >= beta && sc.abs() < MATE_BOUND {
@@ -437,13 +450,16 @@ impl Searcher<'_> {
             }
             return Ok(0);
         }
+        let prev = if ply > 0 { self.stack[ply - 1] } else { None };
         order_moves(
             board,
             &mut moves,
             hash_move,
+            prev,
             ply,
             &self.killers,
             &self.history,
+            &self.counter,
         );
 
         let mut best_move = None;
@@ -470,6 +486,7 @@ impl Searcher<'_> {
                     continue;
                 }
             }
+            self.stack[ply] = Some(mv);
             let undo = board.make_move(mv);
             // Late move reduction for quiet moves ordered late (never killers).
             let mut sc;
@@ -571,9 +588,26 @@ impl Searcher<'_> {
             return Ok(alpha);
         }
         let mut ordered = moves;
-        order_moves(board, &mut ordered, None, ply, &self.killers, &self.history);
+        let prev = if ply > 0 && ply - 1 < self.stack.len() {
+            self.stack[ply - 1]
+        } else {
+            None
+        };
+        order_moves(
+            board,
+            &mut ordered,
+            None,
+            prev,
+            ply,
+            &self.killers,
+            &self.history,
+            &self.counter,
+        );
 
         for mv in ordered {
+            if ply < self.stack.len() {
+                self.stack[ply] = Some(mv);
+            }
             let undo = board.make_move(mv);
             let sc = -self.quiescence(board, -beta, -alpha, ply + 1, poll)?;
             board.unmake_move(undo);
@@ -614,6 +648,12 @@ impl Searcher<'_> {
         }
         let h = &mut self.history[side.idx()][mv.from as usize][mv.to as usize];
         *h = (*h + depth * depth).min(1_000_000);
+        // Countermove: reply `mv` to the move that led here.
+        if ply >= 1 {
+            if let Some(pm) = self.stack[ply - 1] {
+                self.counter[pm.from as usize][pm.to as usize] = Some(mv);
+            }
+        }
     }
 
     fn print_info(&mut self, board: &mut Board, depth: u8, score: i32, start: &Instant) {
@@ -707,11 +747,15 @@ fn order_moves(
     board: &Board,
     moves: &mut [Move],
     hash_move: Option<Move>,
+    prev: Option<Move>,
     ply: usize,
     killers: &[[Option<Move>; 2]; MAX_PLY + 8],
     history: &[[[i32; 64]; 64]; 2],
+    counter: &[[Option<Move>; 64]; 64],
 ) {
     let side = board.side;
+    // Countermove for the move that led here (quiet replies only).
+    let counter_move = prev.and_then(|pm| counter[pm.from as usize][pm.to as usize]);
     let mut scores: Vec<(i32, Move)> = moves
         .iter()
         .map(|&mv| {
@@ -734,12 +778,14 @@ fn order_moves(
                 // En passant: capture a pawn with a pawn.
                 s = 1_000_000 + PieceType::Pawn.value() * 10 - PieceType::Pawn.value();
             } else {
-                // Quiet: killers then history.
+                // Quiet: killers, then countermove, then history.
                 if ply < killers.len() {
                     if killers[ply][0] == Some(mv) {
                         s = 800_000;
                     } else if killers[ply][1] == Some(mv) {
                         s = 790_000;
+                    } else if counter_move == Some(mv) {
+                        s = 785_000;
                     } else {
                         s = history[side.idx()][mv.from as usize][mv.to as usize];
                     }
