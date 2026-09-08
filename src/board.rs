@@ -1,10 +1,15 @@
-//! Board representation (8x8 mailbox), FEN parsing, make/unmake,
-//! attack detection and draw detection. Zobrist hashing included.
+//! Board representation (per-color/per-piece bitboards plus occupancy),
+//! FEN parsing, make/unmake, attack detection and draw detection.
+//! Zobrist hashing included. (A mailbox `squares` array is still synced
+//! alongside for direct lookup; it is removed in a later 3.1 sub-step.)
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::OnceLock;
 
+use crate::bitboard::{
+    bishop_attacks, bit, king_attacks, knight_attacks, pawn_attackers, rook_attacks,
+};
 use crate::types::*;
 
 /// Identity hasher for pre-hashed `u64` keys (Zobrist hashes): std's
@@ -100,6 +105,12 @@ pub struct Undo {
 #[derive(Clone)]
 pub struct Board {
     pub squares: [Option<Piece>; 64],
+    /// Bitboards indexed `[color][piece]`; the source of truth for attacks
+    /// and (later) move generation. Synced with `squares` on every make.
+    pub pieces: [[u64; 6]; 2],
+    /// Occupancy per color, and combined. Rebuilt from `pieces` on make.
+    pub occ: [u64; 2],
+    pub occ_all: u64,
     pub side: Color,
     pub castling: u8,
     pub ep: Option<u8>,
@@ -199,6 +210,9 @@ impl Board {
 
         let mut b = Board {
             squares,
+            pieces: [[0; 6]; 2],
+            occ: [0; 2],
+            occ_all: 0,
             side,
             castling,
             ep,
@@ -208,10 +222,51 @@ impl Board {
             hash_history: Vec::new(),
             hash_counts: HashCounts::default(),
         };
+        for sq in 0..64u8 {
+            if let Some(p) = b.squares[sq as usize] {
+                b.pieces[p.color.idx()][p.pt.idx()] |= bit(sq);
+            }
+        }
+        b.refresh_occupancy();
         b.hash = b.compute_hash();
         b.hash_history.push(b.hash);
         b.hash_counts.insert(b.hash, 1);
         Ok(b)
+    }
+
+    /// Rebuild per-color and combined occupancy from the piece bitboards.
+    fn refresh_occupancy(&mut self) {
+        for c in 0..2 {
+            self.occ[c] = self.pieces[c].iter().fold(0u64, |a, bb| a | bb);
+        }
+        self.occ_all = self.occ[0] | self.occ[1];
+    }
+
+    /// Debug/test helper: every mailbox square agrees with the bitboards,
+    /// and occupancy matches the piece boards.
+    #[cfg(test)]
+    fn check_bb(&self) {
+        for sq in 0..64u8 {
+            let mut found = None;
+            for c in 0..2 {
+                for pt in 0..6 {
+                    if self.pieces[c][pt] & bit(sq) != 0 {
+                        assert!(found.is_none(), "square {sq} on two boards");
+                        found = Some((c, pt));
+                    }
+                }
+            }
+            let expect = self.squares[sq as usize].map(|p| (p.color.idx(), p.pt.idx()));
+            assert_eq!(found, expect, "bitboard/mailbox mismatch on {sq}");
+        }
+        for c in 0..2 {
+            assert_eq!(
+                self.occ[c],
+                self.pieces[c].iter().fold(0u64, |a, bb| a | bb),
+                "occ[{c}] stale"
+            );
+        }
+        assert_eq!(self.occ_all, self.occ[0] | self.occ[1], "occ_all stale");
     }
 
     pub fn to_fen(&self) -> String {
@@ -288,136 +343,40 @@ impl Board {
     }
 
     pub fn king_sq(&self, color: Color) -> Option<u8> {
-        for sq in 0..64 {
-            if let Some(p) = self.squares[sq] {
-                if p.pt == PieceType::King && p.color == color {
-                    return Some(sq as u8);
-                }
-            }
+        let bb = self.pieces[color.idx()][PieceType::King.idx()];
+        if bb == 0 {
+            None
+        } else {
+            // Lowest set bit = first king in 0..64 scan order (same as before).
+            Some(bb.trailing_zeros() as u8)
         }
-        None
     }
 
-    /// Is `sq` attacked by side `by`?
+    /// Is `sq` attacked by side `by`? (Bitboard version: leapers/pawns are
+    /// table ops, sliders walk occupancy rays.)
     pub fn is_square_attacked(&self, sq: u8, by: Color) -> bool {
-        let f = file_of(sq) as i8;
-        let r = rank_of(sq) as i8;
-
+        let bi = by.idx();
         // Pawns.
-        match by {
-            Color::White => {
-                // White pawns attack from one rank below.
-                if r > 0 {
-                    if f > 0 {
-                        if let Some(p) = self.squares[((r - 1) * 8 + (f - 1)) as usize] {
-                            if p.color == Color::White && p.pt == PieceType::Pawn {
-                                return true;
-                            }
-                        }
-                    }
-                    if f < 7 {
-                        if let Some(p) = self.squares[((r - 1) * 8 + (f + 1)) as usize] {
-                            if p.color == Color::White && p.pt == PieceType::Pawn {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-            Color::Black => {
-                if r < 7 {
-                    if f > 0 {
-                        if let Some(p) = self.squares[((r + 1) * 8 + (f - 1)) as usize] {
-                            if p.color == Color::Black && p.pt == PieceType::Pawn {
-                                return true;
-                            }
-                        }
-                    }
-                    if f < 7 {
-                        if let Some(p) = self.squares[((r + 1) * 8 + (f + 1)) as usize] {
-                            if p.color == Color::Black && p.pt == PieceType::Pawn {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
+        if self.pieces[bi][PieceType::Pawn.idx()] & pawn_attackers(sq, by) != 0 {
+            return true;
         }
-
-        // Knights.
-        const N: [(i8, i8); 8] = [
-            (1, 2),
-            (2, 1),
-            (2, -1),
-            (1, -2),
-            (-1, -2),
-            (-2, -1),
-            (-2, 1),
-            (-1, 2),
-        ];
-        for (df, dr) in N {
-            let nf = f + df;
-            let nr = r + dr;
-            if nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
-                if let Some(p) = self.squares[(nr * 8 + nf) as usize] {
-                    if p.color == by && p.pt == PieceType::Knight {
-                        return true;
-                    }
-                }
-            }
+        // Knights, king.
+        if self.pieces[bi][PieceType::Knight.idx()] & knight_attacks(sq) != 0 {
+            return true;
         }
-
-        // King.
-        for df in -1..=1 {
-            for dr in -1..=1 {
-                if df == 0 && dr == 0 {
-                    continue;
-                }
-                let nf = f + df;
-                let nr = r + dr;
-                if nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
-                    if let Some(p) = self.squares[(nr * 8 + nf) as usize] {
-                        if p.color == by && p.pt == PieceType::King {
-                            return true;
-                        }
-                    }
-                }
-            }
+        if self.pieces[bi][PieceType::King.idx()] & king_attacks(sq) != 0 {
+            return true;
         }
-
-        // Sliding pieces: diagonals (bishop/queen).
-        const DIAG: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
-        for (df, dr) in DIAG {
-            let mut nf = f + df;
-            let mut nr = r + dr;
-            while nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
-                if let Some(p) = self.squares[(nr * 8 + nf) as usize] {
-                    if p.color == by && (p.pt == PieceType::Bishop || p.pt == PieceType::Queen) {
-                        return true;
-                    }
-                    break;
-                }
-                nf += df;
-                nr += dr;
-            }
+        // Sliding pieces: diagonals (bishop/queen), orthogonals (rook/queen).
+        let diag =
+            self.pieces[bi][PieceType::Bishop.idx()] | self.pieces[bi][PieceType::Queen.idx()];
+        if bishop_attacks(sq, self.occ_all) & diag != 0 {
+            return true;
         }
-        // Orthogonals (rook/queen).
-        const ORTH: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
-        for (df, dr) in ORTH {
-            let mut nf = f + df;
-            let mut nr = r + dr;
-            while nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
-                if let Some(p) = self.squares[(nr * 8 + nf) as usize] {
-                    if p.color == by && (p.pt == PieceType::Rook || p.pt == PieceType::Queen) {
-                        return true;
-                    }
-                    break;
-                }
-                nf += df;
-                nr += dr;
-            }
+        let orth = self.pieces[bi][PieceType::Rook.idx()] | self.pieces[bi][PieceType::Queen.idx()];
+        if rook_attacks(sq, self.occ_all) & orth != 0 {
+            return true;
         }
-
         false
     }
 
@@ -514,6 +473,35 @@ impl Board {
             }
         }
 
+        // Mirror the piece movement on the bitboards.
+        {
+            let si = side.idx();
+            let ei = side.opposite().idx();
+            self.pieces[si][mover.pt.idx()] &= !bit(mv.from);
+            if let Some(cap) = undo.captured {
+                self.pieces[ei][cap.pt.idx()] &= !bit(captured_sq);
+            }
+            let placed_pt = mv.promotion.unwrap_or(mover.pt);
+            self.pieces[si][placed_pt.idx()] |= bit(mv.to);
+            if mover.pt == PieceType::King
+                && (file_of(mv.from) as i8 - file_of(mv.to) as i8).abs() == 2
+            {
+                let (rf, rt) = match mv.to {
+                    x if x == G1 => (H1, 5),
+                    x if x == C1 => (A1, 3),
+                    x if x == G8 => (H8, 61),
+                    x if x == C8 => (A8, 59),
+                    _ => (0, 0),
+                };
+                if rf != rt {
+                    let ri = PieceType::Rook.idx();
+                    self.pieces[si][ri] &= !bit(rf);
+                    self.pieces[si][ri] |= bit(rt);
+                }
+            }
+            self.refresh_occupancy();
+        }
+
         // Pawn double push -> set EP square.
         if mover.pt == PieceType::Pawn && (rank_of(mv.from) as i8 - rank_of(mv.to) as i8).abs() == 2
         {
@@ -598,6 +586,35 @@ impl Board {
         if let Some(cap) = undo.captured {
             self.squares[undo.captured_sq as usize] = Some(cap);
         }
+
+        // Mirror the restoration on the bitboards (`mover`/`orig`/`cap`
+        // above carry the pre-move piece identities).
+        {
+            let si = self.side.idx();
+            let ei = self.side.opposite().idx();
+            self.pieces[si][mover.pt.idx()] &= !bit(mv.to);
+            if let Some(cap) = undo.captured {
+                self.pieces[ei][cap.pt.idx()] |= bit(undo.captured_sq);
+            }
+            self.pieces[si][orig.pt.idx()] |= bit(mv.from);
+            if mover.pt == PieceType::King
+                && (file_of(mv.from) as i8 - file_of(mv.to) as i8).abs() == 2
+            {
+                let (rf, rt) = match mv.to {
+                    x if x == G1 => (5, H1),
+                    x if x == C1 => (3, A1),
+                    x if x == G8 => (61, H8),
+                    x if x == C8 => (59, A8),
+                    _ => (0, 0),
+                };
+                if rf != rt {
+                    let ri = PieceType::Rook.idx();
+                    self.pieces[si][ri] &= !bit(rf);
+                    self.pieces[si][ri] |= bit(rt);
+                }
+            }
+            self.refresh_occupancy();
+        }
     }
 
     /// Null move: pass the turn (used in null-move pruning).
@@ -661,16 +678,21 @@ impl Board {
 
     /// K vs K or K+minor vs K.
     pub fn is_insufficient_material(&self) -> bool {
-        let mut minors = 0;
-        for sq in 0..64 {
-            if let Some(p) = self.squares[sq] {
-                match p.pt {
-                    PieceType::King => {}
-                    PieceType::Knight | PieceType::Bishop => minors += 1,
-                    _ => return false,
-                }
+        // Any pawn, rook or queen on either side: sufficient.
+        for c in 0..2 {
+            if self.pieces[c][PieceType::Pawn.idx()]
+                | self.pieces[c][PieceType::Rook.idx()]
+                | self.pieces[c][PieceType::Queen.idx()]
+                != 0
+            {
+                return false;
             }
         }
+        let minors = (self.pieces[0][PieceType::Knight.idx()]
+            | self.pieces[0][PieceType::Bishop.idx()]
+            | self.pieces[1][PieceType::Knight.idx()]
+            | self.pieces[1][PieceType::Bishop.idx()])
+        .count_ones();
         minors <= 1
     }
 
@@ -735,6 +757,32 @@ mod tests {
     fn play(b: &mut Board, uci: &str) -> Undo {
         let mv = Move::from_uci(uci).unwrap();
         b.make_move(mv)
+    }
+
+    #[test]
+    fn bitboards_track_mailbox() {
+        // Walk the perft tree; at every node the bitboards must agree with
+        // the mailbox on all 64 squares (catches make/unmake sync bugs).
+        fn walk(b: &mut Board, depth: u32) {
+            b.check_bb();
+            if depth == 0 {
+                return;
+            }
+            for mv in crate::movegen::generate_legal(b) {
+                let u = b.make_move(mv);
+                walk(b, depth - 1);
+                b.unmake_move(u);
+                b.check_bb();
+            }
+        }
+        for fen in [
+            STARTPOS_FEN,
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ] {
+            let mut b = Board::from_fen(fen).unwrap();
+            walk(&mut b, 3);
+        }
     }
 
     #[test]
