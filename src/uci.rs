@@ -15,13 +15,14 @@ use crate::movegen::{generate_legal, perft};
 use crate::search::{search_root, Limits, TT};
 use crate::types::Move;
 
-pub const ENGINE_NAME: &str = "Ferrum 1.1";
+pub const ENGINE_NAME: &str = "Ferrum 2.0";
 pub const ENGINE_AUTHOR: &str = "opencode";
 
 pub struct Engine {
     board: Board,
     tt: TT,
     hash_mb: usize,
+    threads: usize,
     quit_after_search: Arc<AtomicBool>,
 }
 
@@ -31,6 +32,7 @@ impl Engine {
             board: Board::new_startpos(),
             tt: TT::new(16),
             hash_mb: 16,
+            threads: 1,
             quit_after_search: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -98,6 +100,7 @@ fn handle_command(
             println!("id name {}", ENGINE_NAME);
             println!("id author {}", ENGINE_AUTHOR);
             println!("option name Hash type spin default 16 min 1 max 1024");
+            println!("option name Threads type spin default 1 min 1 max 256");
             println!("uciok");
             flush();
         }
@@ -123,8 +126,14 @@ fn handle_command(
                             eng.set_hash(mb);
                         }
                     }
+                } else if name == "threads" {
+                    if let Some(v) = value {
+                        if let Ok(t) = v.parse::<usize>() {
+                            eng.threads = t.clamp(1, 256);
+                        }
+                    }
                 }
-                // Other options (Threads, etc.) accepted and ignored: single-threaded.
+                // Other options accepted and ignored.
             }
         }
         "ucinewgame" => {
@@ -362,7 +371,7 @@ fn run_search(
         }
     };
 
-    let res = search_root(&mut eng.board, &eng.tt, limits, &mut poll);
+    let res = search_root(&mut eng.board, &eng.tt, limits, eng.threads, &mut poll);
 
     // Flush deferred isready as readyok now (UCI expects prompt reply).
     let mut saw_ready = false;
@@ -407,7 +416,7 @@ pub fn search_cli(depth: u8, fen: &str) {
         ..Default::default()
     };
     let mut no_poll = || false;
-    let res = search_root(&mut eng.board, &eng.tt, &lim, &mut no_poll);
+    let res = search_root(&mut eng.board, &eng.tt, &lim, 1, &mut no_poll);
     match res.best {
         Some(mv) => println!("bestmove {} score {}", mv.to_uci(), res.score),
         None => println!("bestmove 0000"),
@@ -442,7 +451,7 @@ fn run_bench(eng: &mut Engine, depth: u8) {
         };
         let mut no_poll = || false;
         let pt = Instant::now();
-        let res = search_root(&mut b, &eng.tt, &lim, &mut no_poll);
+        let res = search_root(&mut b, &eng.tt, &lim, 1, &mut no_poll);
         let dt = pt.elapsed();
         total_nodes += res.nodes;
         println!(

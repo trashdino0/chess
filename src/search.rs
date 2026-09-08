@@ -2,8 +2,8 @@
 //! quiescence, transposition table, null-move pruning, LMR, check extensions,
 //! killer + history move ordering and MVV-LVA capture ordering.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::bitboard::bit;
@@ -254,26 +254,117 @@ pub struct SearchResult {
 /// Run iterative deepening on `board`, printing UCI `info` lines.
 /// `poll()` is called periodically; returning true aborts the search
 /// (used for the UCI `stop` command). Returns best move + score.
+///
+/// `threads >= 2` runs Lazy SMP: helper threads search owned board clones
+/// sharing the TT, staggered to deeper start depths; the deepest completed
+/// result across all threads is reported.
 pub fn search_root(
     board: &mut Board,
     tt: &TT,
     limits: &Limits,
+    threads: usize,
     poll: &mut dyn FnMut() -> bool,
 ) -> SearchResult {
-    let mut s = Searcher {
-        tt: tt.clone(),
-        killers: [[None; 2]; MAX_PLY + 8],
-        history: [[[0; 64]; 64]; 2],
-        counter: [[None; 64]; 64],
-        stack: [None; MAX_PLY + 32],
-        nodes: 0,
-        seldepth: 0,
-        deadline: limits
-            .think_time_ms(board.side)
-            .map(|ms| Instant::now() + Duration::from_millis(ms)),
-        max_depth: limits.max_depth(),
+    let n = threads.clamp(1, 256);
+    // Shared by value, never shared by reference: each thread builds its own
+    // `Instant` deadline from this (Instants are not shareable).
+    let think_ms = limits.think_time_ms(board.side);
+    let max_d = limits.max_depth();
+    if n == 1 {
+        let mut s = Searcher::new(tt.clone(), think_ms, max_d, 0, None, 1);
+        return s.iterate(board, poll);
+    }
+    let shared = Arc::new(Shared {
+        stop: AtomicBool::new(false),
+        best: Mutex::new(SharedBest {
+            depth: 0,
+            mv: None,
+            score: 0,
+        }),
+        nodes: (0..n).map(|_| AtomicU64::new(0)).collect(),
+    });
+    // Owned clones for helpers (made up front: `thread::scope` can't hand
+    // out `&mut` borrows of one Vec across iterations, but owned moves in).
+    let helper_boards: Vec<Board> = (1..n).map(|_| board.clone()).collect();
+    let main_res = std::thread::scope(|scope| {
+        for (i, mut hb) in helper_boards.into_iter().enumerate() {
+            let tid = i + 1;
+            let tt = tt.clone();
+            let lim = limits.clone();
+            let shared = Arc::clone(&shared);
+            scope.spawn(move || {
+                helper_search(&mut hb, &tt, &lim, tid, &shared);
+            });
+        }
+        // Main thread: keeps the channel-draining `poll`, and forwards any
+        // abort to the helpers via shared stop.
+        let mut main_poll = || {
+            if poll() {
+                shared.stop.store(true, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        };
+        let mut s = Searcher::new(tt.clone(), think_ms, max_d, 0, Some(Arc::clone(&shared)), 1);
+        let res = s.iterate(board, &mut main_poll);
+        shared.stop.store(true, Ordering::Relaxed);
+        res
+    });
+    // Helpers joined. Deepest completed result wins; the local fallback
+    // preserves the piped-stdin depth-1 behavior (abort before any iteration
+    // completes leaves `shared.best` empty).
+    let total_nodes = main_res.nodes
+        + shared
+            .nodes
+            .iter()
+            .skip(1)
+            .map(|a| a.load(Ordering::Relaxed))
+            .sum::<u64>();
+    let locked = shared.best.lock().unwrap();
+    let (best, score) = match locked.mv {
+        Some(mv) => (Some(mv), locked.score),
+        None => (main_res.best, main_res.score),
     };
-    s.iterate(board, poll)
+    SearchResult {
+        best,
+        score,
+        nodes: total_nodes,
+    }
+}
+
+/// Deepest completed result published by any SMP thread.
+struct SharedBest {
+    depth: u8,
+    mv: Option<Move>,
+    score: i32,
+}
+
+struct Shared {
+    stop: AtomicBool,
+    best: Mutex<SharedBest>,
+    /// Per-thread node counts (`nodes[0]` unused: the main thread reports
+    /// its own count; helpers publish theirs every 1024 nodes + at exit).
+    nodes: Vec<AtomicU64>,
+}
+
+/// One Lazy SMP helper: own board, own tables, shared TT, silent.
+fn helper_search(board: &mut Board, tt: &TT, limits: &Limits, tid: usize, shared: &Arc<Shared>) {
+    let think_ms = limits.think_time_ms(board.side);
+    let max_d = limits.max_depth();
+    let start_depth = (1 + tid as u8).min(max_d);
+    let mut poll = || shared.stop.load(Ordering::Relaxed);
+    let mut s = Searcher::new(
+        tt.clone(),
+        think_ms,
+        max_d,
+        tid,
+        Some(Arc::clone(shared)),
+        start_depth,
+    );
+    let res = s.iterate(board, &mut poll);
+    // Flush the remainder (< 1024 nodes) that `tick` hasn't published yet.
+    shared.nodes[tid].store(res.nodes, Ordering::Relaxed);
 }
 
 struct Searcher {
@@ -291,9 +382,42 @@ struct Searcher {
     seldepth: u32,
     deadline: Option<Instant>,
     max_depth: u8,
+    /// SMP identity (0 = main, prints; >= 1 = helper, silent).
+    tid: usize,
+    shared: Option<Arc<Shared>>,
+    /// First iterative-deepening depth (helpers stagger deeper to diversify).
+    start_depth: u8,
 }
 
 impl Searcher {
+    fn new(
+        tt: TT,
+        think_ms: Option<u64>,
+        max_depth: u8,
+        tid: usize,
+        shared: Option<Arc<Shared>>,
+        start_depth: u8,
+    ) -> Searcher {
+        Searcher {
+            tt,
+            killers: [[None; 2]; MAX_PLY + 8],
+            history: [[[0; 64]; 64]; 2],
+            counter: [[None; 64]; 64],
+            stack: [None; MAX_PLY + 32],
+            nodes: 0,
+            seldepth: 0,
+            deadline: think_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
+            max_depth,
+            tid,
+            shared,
+            start_depth,
+        }
+    }
+
+    fn silent(&self) -> bool {
+        self.tid != 0
+    }
+
     fn check_time(&self) -> bool {
         match self.deadline {
             Some(d) => Instant::now() >= d,
@@ -303,8 +427,15 @@ impl Searcher {
 
     #[inline]
     fn tick(&mut self, poll: &mut dyn FnMut() -> bool) -> Result<(), Abort> {
-        if self.nodes & 1023 == 0 && (self.check_time() || poll()) {
-            return Err(Abort);
+        if self.nodes & 1023 == 0 {
+            // Publish helper progress for combined info-nps; the main
+            // thread's own count stays authoritative for its total.
+            if let Some(sh) = &self.shared {
+                sh.nodes[self.tid].store(self.nodes, Ordering::Relaxed);
+            }
+            if self.check_time() || poll() {
+                return Err(Abort);
+            }
         }
         Ok(())
     }
@@ -336,7 +467,7 @@ impl Searcher {
         let mut score = side_eval(board);
         let max_d = self.max_depth.min(MAX_PLY as u8);
 
-        for depth in 1..=max_d {
+        for depth in self.start_depth.max(1)..=max_d {
             let prev = score;
             // Aspiration windows from depth 4 on (skipped after a mate score:
             // mate scores + narrow windows only waste re-searches).
@@ -380,6 +511,15 @@ impl Searcher {
             // (Root ply = 0, so no mate-score adjustment is needed.)
             self.tt
                 .store(board.hash, Some(best), score, depth, TT_EXACT);
+            // Publish for SMP: deepest completed iteration wins.
+            if let Some(sh) = &self.shared {
+                let mut b = sh.best.lock().unwrap();
+                if depth >= b.depth {
+                    b.depth = depth;
+                    b.mv = Some(best);
+                    b.score = score;
+                }
+            }
             self.print_info(board, depth, score, &start);
             if score.abs() >= MATE_BOUND {
                 break; // found forced mate; deeper search is pointless
@@ -758,8 +898,24 @@ impl Searcher {
     }
 
     fn print_info(&mut self, board: &mut Board, depth: u8, score: i32, start: &Instant) {
+        if self.silent() {
+            return;
+        }
         let ms = start.elapsed().as_millis().max(1) as u64;
-        let nps = self.nodes * 1000 / ms;
+        // Combined effort across threads so SMP scaling shows in nps.
+        let helper_nodes: u64 = self
+            .shared
+            .as_ref()
+            .map(|sh| {
+                sh.nodes
+                    .iter()
+                    .skip(1)
+                    .map(|a| a.load(Ordering::Relaxed))
+                    .sum()
+            })
+            .unwrap_or(0);
+        let shown_nodes = self.nodes + helper_nodes;
+        let nps = shown_nodes * 1000 / ms;
         let score_str = if score.abs() >= MATE_BOUND {
             let plies = MATE - score.abs();
             let moves = (plies + 1) / 2;
@@ -774,7 +930,7 @@ impl Searcher {
             depth,
             self.seldepth,
             score_str,
-            self.nodes,
+            shown_nodes,
             nps,
             ms,
             self.tt.hashfull(),
@@ -976,6 +1132,30 @@ mod tests {
         tt.store(1000 + n, Some(m2), 22, 1, TT_EXACT);
         assert!(tt.probe(1000).is_none(), "evicted key must miss");
         assert_eq!(tt.probe(1000 + n).unwrap().best, Some(m2));
+    }
+
+    #[test]
+    fn smp_search_returns_legal_move() {
+        // Multi-threaded search must return a legal move. No exact-score
+        // assertion: shared-TT timing makes tied depths nondeterministic.
+        let mut board =
+            crate::board::Board::from_fen(crate::board::STARTPOS_FEN).expect("valid startpos");
+        let tt = TT::new(1);
+        let lim = Limits {
+            depth: Some(4),
+            ..Default::default()
+        };
+        let mut no_poll = || false;
+        let res = search_root(&mut board, &tt, &lim, 4, &mut no_poll);
+        let mv = res.best.expect("must return a move");
+        assert!(crate::movegen::generate_legal(&mut board).contains(&mv));
+        assert!(res.nodes > 0);
+        // Single-threaded path still works through the same entry point.
+        let mut board2 =
+            crate::board::Board::from_fen(crate::board::STARTPOS_FEN).expect("valid startpos");
+        let res1 = search_root(&mut board2, &tt, &lim, 1, &mut no_poll);
+        let mv1 = res1.best.expect("must return a move");
+        assert!(crate::movegen::generate_legal(&mut board2).contains(&mv1));
     }
 
     #[test]
