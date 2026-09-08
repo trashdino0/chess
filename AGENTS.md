@@ -1,4 +1,4 @@
-# AGENTS.md — chess-engine (Ferrum 1.0)
+# AGENTS.md — chess-engine (Ferrum 2.0)
 
 Rust UCI chess engine. Std-only (zero deps by design — don't add crates).
 `src/`: `types` → `board` → `movegen` → `eval` → `search` → `uci` → `main`.

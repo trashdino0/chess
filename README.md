@@ -33,11 +33,11 @@ Or use a GUI (Cutechess / Arena) that manages the process properly.
 ## Architecture (invariants)
 
 - `Move` = `{from: u8, to: u8, promotion: Option<PieceType>}`. Castling / EP / double-push inferred inside `make_move` — never add flags to `Move`.
-- Board: mailbox (`[Option<Piece>; 64]`), FEN parse/generate, Zobrist hashing (`SplitMix64`), undo stack (`Undo`), 50-move / repetition (O(1) `hash_counts` map synced in make/unmake) / insufficient-material draw detection.
+- Board: per-color/per-piece bitboards (`pieces[[u64;6];2]` + `occ[2]` + `occ_all`), FEN parse/generate, Zobrist hashing (`SplitMix64`), undo stack (`Undo`), 50-move / repetition (O(1) `hash_counts` map synced in make/unmake) / insufficient-material draw detection.
 - Movegen: pseudo-legal (`generate_pseudo`) then legal (`generate_legal` via make/unmake + `in_check`). Quiescence uses direct capture-only generation (`generate_pseudo_captures`). Perft verified against standard positions.
 - Eval (`src/eval.rs`): material + tapered piece-square tables (middlegame/endgame interpolation for King; middgame PST for others), pawn structure (passed/isolated/doubled, passers scored by king distance to promotion), rook open/semi-open + 7th-rank bonus, N/B/R/Q mobility, pawn-shield king safety (faded out in the endgame), bishop-pair bonus. All terms symmetric (color-mirrored positions negate exactly); startpos evaluates to `0`.
-- Search (`src/search.rs`): iterative deepening, aspiration windows (from depth 4, with widening on fail-high/low), transposition table (depth-preferred replacement), null-move pruning (depth >=3, not in check, non-pawn material), internal iterative reduction (depth >=6, no hash move), check extension (capped at depth +1), quiescence with delta pruning (promotions/search-captures only; captures skipped if victim + static_eval + 150 <= alpha), late-move pruning (skip very late quiet non-killer moves near leaves), killer + countermove + history move ordering, MVV-LVA capture ordering.
-- UCI (`uci.rs`): stdin-reader thread forwards lines over `mpsc`; `go` runs on main thread with periodic `poll()` checking the channel for `stop`/`quit`. `isready` deferred mid-search flushed after `go`.
+- Search (`src/search.rs`): iterative deepening, aspiration windows (from depth 4, with widening on fail-high/low), lock-free shared transposition table (atomics + xor checksum, depth-preferred replacement), Lazy SMP via the `Threads` option (helpers on staggered depths, deepest result wins), null-move pruning (depth >=3, not in check, non-pawn material), internal iterative reduction (depth >=6, no hash move), check extension (capped at depth +1), quiescence with delta pruning (promotions/search-captures only; captures skipped if victim + static_eval + 150 <= alpha), late-move pruning (skip very late quiet non-killer moves near leaves), killer + countermove + history move ordering, MVV-LVA capture ordering.
+- UCI (`uci.rs`): stdin-reader thread forwards lines over `mpsc`; `go` runs on main thread with periodic `poll()` checking the channel for `stop`/`quit`. `isready` deferred mid-search flushed after `go`. Options: `Hash` (MB), `Threads` (1–256, default 1).
 
 ## Benchmark / test helpers
 
@@ -53,7 +53,7 @@ Or use a GUI (Cutechess / Arena) that manages the process properly.
 - `Cargo.toml`: `edition = 2024`, std-only, `profile.release` `opt-level=3`, `profile.dev` `opt-level=1` (keeps perft d4 fast in tests).
 - `AGENTS.md`: detailed architecture invariants, verification commands, and design notes.
 - `src/types.rs`: colors, piece types, square indexing (`0 = a1`), castling rights bits (`WK`, `WQ`, `BK`, `BQ`).
-- `src/board.rs`: mailbox board, FEN, Zobrist (`OnceLock<Tables>`), `make_move`/`unmake_move`/`make_null`, `is_square_attacked`, `in_check`, `is_draw`, `pretty()`.
+- `src/board.rs`: bitboard board, FEN, Zobrist (`OnceLock<Tables>`), `make_move`/`unmake_move`/`make_null`, `is_square_attacked`, `in_check`, `is_draw`, `pretty()`.
 - `src/movegen.rs`: pseudo-legal + legal generation, castling, promotion, `perft()`.
 - `src/eval.rs`: PSTs (`PAWN`, `KNIGHT`, `BISHOP`, `ROOK`, `QUEEN`, `KING_MG`), tapered `KING_EG`, `evaluate()` with phase, pawn/rook terms.
 - `src/search.rs`: `search_root()`, `negamax()`, `quiescence()`, `TT`, `order_moves()`.
@@ -80,9 +80,9 @@ cargo build --release
 
 ## Known limitations / design choices
 
-- Zero external crates by design; no bitboards, no SIMD, no parallel search threads.
+- Zero external crates by design; no SIMD, no neural network. `bench`/`search` CLI shortcuts run single-threaded for determinism.
 - `generate_legal()` creates a full pseudo-legal vector (`Vec<Move>`), then filters by `in_check()` after `make_move`. This is simple but not the fastest possible.
-- Transposition table uses a simple fixed-size power-of-two array with depth-preferred replacement; no generation aging yet.
+- Transposition table is a lock-free shared power-of-two array with depth-preferred replacement; no generation aging yet.
 - No opening book, no endgame tablebases, no learning / neural network.
 - Search depth is bounded by `MAX_PLY` (64) and a time/deadline mechanism; `infinite` mode relies on `poll()`.
 - EPD/opening files for cutechess must contain only FEN lines (no `#` comments); `benchmarks/openings.epd` is clean.
