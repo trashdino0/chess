@@ -266,6 +266,67 @@ fn gen_slider_captures(
     }
 }
 
+/// Pseudo-legal destination count for one piece, for eval mobility.
+/// Counts quiet + capture destinations (mirrors the gen_* logic above;
+/// not legality-checked). Pawns, kings and empty squares count 0.
+pub fn mobility_count(board: &Board, sq: u8) -> u32 {
+    let (side, pt) = match board.squares[sq as usize] {
+        Some(p) => (p.color, p.pt),
+        None => return 0,
+    };
+    match pt {
+        PieceType::Knight => count_stepper(board, sq, side, &KNIGHT_JUMPS),
+        PieceType::Bishop => count_slider(board, sq, side, &DIAG),
+        PieceType::Rook => count_slider(board, sq, side, &ORTH),
+        PieceType::Queen => {
+            count_slider(board, sq, side, &DIAG) + count_slider(board, sq, side, &ORTH)
+        }
+        _ => 0,
+    }
+}
+
+fn count_stepper(board: &Board, sq: u8, side: Color, deltas: &[(i8, i8)]) -> u32 {
+    let f = file_of(sq) as i8;
+    let r = rank_of(sq) as i8;
+    let mut n = 0u32;
+    for (df, dr) in deltas {
+        let nf = f + df;
+        let nr = r + dr;
+        if nf < 0 || nf >= 8 || nr < 0 || nr >= 8 {
+            continue;
+        }
+        match board.squares[make_sq(nf as u8, nr as u8) as usize] {
+            None => n += 1,
+            Some(p) if p.color != side => n += 1,
+            _ => {}
+        }
+    }
+    n
+}
+
+fn count_slider(board: &Board, sq: u8, side: Color, deltas: &[(i8, i8)]) -> u32 {
+    let f = file_of(sq) as i8;
+    let r = rank_of(sq) as i8;
+    let mut n = 0u32;
+    for (df, dr) in deltas {
+        let mut nf = f + df;
+        let mut nr = r + dr;
+        while nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
+            match board.squares[make_sq(nf as u8, nr as u8) as usize] {
+                None => n += 1,
+                Some(p) if p.color != side => {
+                    n += 1;
+                    break;
+                }
+                _ => break,
+            }
+            nf += df;
+            nr += dr;
+        }
+    }
+    n
+}
+
 fn gen_castling(board: &Board, side: Color, moves: &mut Vec<Move>) {
     match side {
         Color::White => {
@@ -443,6 +504,30 @@ mod tests {
         let fen = "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1";
         assert_eq!(perft_fen(fen, 4), 43_238);
         assert_eq!(perft_fen(fen, 5), 674_624);
+    }
+
+    #[test]
+    fn mobility_counts() {
+        // Knight d4: 8; knight a1: b3 + c2 = 2.
+        let b = Board::from_fen("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(mobility_count(&b, 27), 8);
+        let b = Board::from_fen("4k3/8/8/8/8/8/8/N3K3 w - - 0 1").unwrap();
+        assert_eq!(mobility_count(&b, 0), 2);
+        // Bishop d4 on an open board: 13; fully blocked by own pawns: 0.
+        let b = Board::from_fen("4k3/8/8/8/3B4/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(mobility_count(&b, 27), 13);
+        let b = Board::from_fen("4k3/8/8/2P1P3/3B4/2P1P3/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(mobility_count(&b, 27), 0);
+        // Rook d4: 14; queen d4: 13 + 14 = 27.
+        let b = Board::from_fen("4k3/8/8/8/3R4/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(mobility_count(&b, 27), 14);
+        let b = Board::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(mobility_count(&b, 27), 27);
+        // Pawns, kings and empty squares count 0.
+        let b = Board::new_startpos();
+        assert_eq!(mobility_count(&b, 8), 0); // white a-pawn
+        assert_eq!(mobility_count(&b, 4), 0); // white king
+        assert_eq!(mobility_count(&b, 27), 0); // empty d4
     }
 
     fn sort_moves(moves: &mut [Move]) {

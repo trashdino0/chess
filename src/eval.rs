@@ -2,6 +2,7 @@
 //! plus a small bishop-pair bonus.
 
 use crate::board::Board;
+use crate::movegen::mobility_count;
 use crate::types::*;
 
 // PSTs in "rank8-first" order (a8..h1), from White's perspective.
@@ -88,6 +89,24 @@ const KING_EG: [i32; 64] = [
 /// Passed-pawn bonus by rank index (0 = rank 1). Pawns never stand on the
 /// 1st/8th rank, so the endpoints stay 0.
 const PASSED_BONUS: [i32; 8] = [0, 0, 10, 20, 35, 60, 100, 0];
+
+/// Mobility weights in centipawns per pseudo-legal destination
+/// (knights/bishops/rooks/queens only; pawns and kings are covered by
+/// structure/safety terms). Kept small: mobility guides, never dominates.
+const MOB_KNIGHT: i32 = 2;
+const MOB_BISHOP: i32 = 2;
+const MOB_ROOK: i32 = 2;
+const MOB_QUEEN: i32 = 1;
+
+fn mobility_weight(pt: PieceType) -> i32 {
+    match pt {
+        PieceType::Knight => MOB_KNIGHT,
+        PieceType::Bishop => MOB_BISHOP,
+        PieceType::Rook => MOB_ROOK,
+        PieceType::Queen => MOB_QUEEN,
+        _ => 0,
+    }
+}
 
 const ISOLATED_PENALTY: i32 = -12;
 const DOUBLED_PENALTY: i32 = -14;
@@ -289,8 +308,9 @@ fn rook_bonus(color: Color, r: usize, f: usize, own: &[u8; 8], enemy: &[u8; 8]) 
 ///
 /// Material + middlegame PSTs, a tapered king table (shelter early, activity
 /// late), pawn structure (passed / isolated / doubled), rooks on open files
-/// and on the 7th rank, plus a small bishop-pair bonus. All terms are
-/// symmetric, so the startpos still evaluates to exactly 0.
+/// and on the 7th rank, piece mobility (N/B/R/Q pseudo-legal move counts),
+/// plus a small bishop-pair bonus. All terms are symmetric, so the startpos
+/// still evaluates to exactly 0.
 pub fn evaluate(board: &Board) -> i32 {
     // First pass: game phase + pawn locations per file (rank bitmasks).
     let mut phase = 0i32;
@@ -356,6 +376,12 @@ pub fn evaluate(board: &Board) -> i32 {
                 Color::White => white_bishops += 1,
                 Color::Black => black_bishops += 1,
             },
+            _ => {}
+        }
+        match p.pt {
+            PieceType::Knight | PieceType::Bishop | PieceType::Rook | PieceType::Queen => {
+                u += mobility_weight(p.pt) * mobility_count(board, sq) as i32;
+            }
             _ => {}
         }
         match p.color {
@@ -432,7 +458,18 @@ mod tests {
         let w = Board::from_fen("4k3/8/8/8/3B4/8/8/4K3 w - - 0 1").unwrap();
         let b = Board::from_fen("4k3/8/8/3b4/8/8/8/4K3 w - - 0 1").unwrap();
         assert_eq!(evaluate(&w), -evaluate(&b));
-        // White Bd4, phase 1: 330 + bishop PST 19 + development 6 + 4.
-        assert_eq!(evaluate(&w), 359);
+        // White Bd4, phase 1: 330 + bishop PST 19 + development 6 + 4
+        // + mobility 13x2.
+        assert_eq!(evaluate(&w), 385);
+    }
+
+    #[test]
+    fn mobility_term_scores() {
+        // Ke1 + Na1 vs Ke8, phase 1: material 320, knight PST -50
+        // (corner in both MG and EG tables), mobility 2 moves x 2 = 4,
+        // kings cancel (both tapered to -28), knight undeveloped (no dev
+        // bonus). Total: 320 - 50 + 4 = 274 (270 without the term).
+        let b = Board::from_fen("4k3/8/8/8/8/8/8/N3K3 w - - 0 1").unwrap();
+        assert_eq!(evaluate(&b), 274);
     }
 }
