@@ -97,26 +97,16 @@ const ROOK_SEVENTH_BONUS: i32 = 20;
 
 /// Endgame bishop table: central diagonals are best.
 const BISHOP_EG: [i32; 64] = [
-    -20, -10, -10, -10, -10, -10, -10, -20,
-    -10,  0,   0,   0,   0,   0,   0, -10,
-    -10,  0,   5,  10,  10,   5,   0, -10,
-    -10,  0,  10,  20,  20,  10,   0, -10,
-    -10,  0,  10,  20,  20,  10,   0, -10,
-    -10,  0,   5,  10,  10,   5,   0, -10,
-    -10,  0,   0,   0,   0,   0,   0, -10,
-    -20, -10, -10, -10, -10, -10, -10, -20,
+    -20, -10, -10, -10, -10, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 10, 10, 5, 0,
+    -10, -10, 0, 10, 20, 20, 10, 0, -10, -10, 0, 10, 20, 20, 10, 0, -10, -10, 0, 5, 10, 10, 5, 0,
+    -10, -10, 0, 0, 0, 0, 0, 0, -10, -20, -10, -10, -10, -10, -10, -10, -20,
 ];
 
 /// Endgame knight table: central squares best, edges/corners worst.
 const KNIGHT_EG: [i32; 64] = [
-    -50, -40, -30, -30, -30, -30, -40, -50,
-    -40, -20,   0,   5,   5,   0, -20, -40,
-    -30,   0,  10,  15,  15,  10,   0, -30,
-    -30,   5,  15,  20,  20,  15,   5, -30,
-    -30,   5,  15,  20,  20,  15,   5, -30,
-    -30,   0,  10,  15,  15,  10,   0, -30,
-    -40, -20,   0,   5,   5,   0, -20, -40,
-    -50, -40, -30, -30, -30, -30, -40, -50,
+    -50, -40, -30, -30, -30, -30, -40, -50, -40, -20, 0, 5, 5, 0, -20, -40, -30, 0, 10, 15, 15, 10,
+    0, -30, -30, 5, 15, 20, 20, 15, 5, -30, -30, 5, 15, 20, 20, 15, 5, -30, -30, 0, 10, 15, 15, 10,
+    0, -30, -40, -20, 0, 5, 5, 0, -20, -40, -50, -40, -30, -30, -30, -30, -40, -50,
 ];
 
 /// Game-phase weights (N/B = 1, R = 2, Q = 4; K and pawns = 0; max 24).
@@ -171,13 +161,16 @@ fn knight_pst(sq: u8, color: Color, phase: i32) -> i32 {
     (mg * phase + eg * (24 - phase)) / 24
 }
 
-/// Development bonus: small reward for developed knights/bishops (not on
-/// starting squares) and for controlling central files/ranks. This is
-/// phase-independent (pure mobility/development term).
+/// Development bonus from White's perspective: small reward for developed
+/// knights/bishops (not on starting squares) and for controlling central
+/// files/ranks. Signed by owner color (a developed black piece is good for
+/// Black). This is phase-independent (pure mobility/development term).
 fn development_bonus(board: &Board) -> i32 {
     let mut dev = 0i32;
     for sq in 0..64u8 {
-        let Some(p) = board.squares[sq as usize] else { continue };
+        let Some(p) = board.squares[sq as usize] else {
+            continue;
+        };
         if p.pt == PieceType::Knight || p.pt == PieceType::Bishop {
             let r = rank_of(sq) as usize;
             let f = file_of(sq) as usize;
@@ -186,12 +179,17 @@ fn development_bonus(board: &Board) -> i32 {
                 Color::White => r == 0, // White starts at rank 1 (r=0)
                 Color::Black => r == 7, // Black starts at rank 8 (r=7)
             };
+            let mut u = 0;
             if !on_back {
-                dev += 6; // developed minor piece (tuned down from 8)
+                u += 6; // developed minor piece (tuned down from 8)
             }
             // Central control bonus.
             if (3..=4).contains(&f) && (3..=4).contains(&r) {
-                dev += 4; // central square (tuned down from 5)
+                u += 4; // central square (tuned down from 5)
+            }
+            match p.color {
+                Color::White => dev += u,
+                Color::Black => dev -= u,
             }
         }
     }
@@ -423,5 +421,18 @@ mod tests {
         // Bare kings: the centralized side scores positively.
         let b = Board::from_fen("4k3/8/8/8/4K3/8/8/8 w - - 0 1").unwrap();
         assert!(evaluate(&b) > 0);
+    }
+
+    #[test]
+    fn eval_is_color_symmetric() {
+        // Vertical mirror with colors flipped must negate exactly: every
+        // term (material, PSTs, development) is owner-perspective signed.
+        // (Catches the old development_bonus bug, which credited Black's
+        // development to White; startpos == 0 masked it.)
+        let w = Board::from_fen("4k3/8/8/8/3B4/8/8/4K3 w - - 0 1").unwrap();
+        let b = Board::from_fen("4k3/8/8/3b4/8/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(evaluate(&w), -evaluate(&b));
+        // White Bd4, phase 1: 330 + bishop PST 19 + development 6 + 4.
+        assert_eq!(evaluate(&w), 359);
     }
 }
