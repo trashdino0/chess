@@ -1,58 +1,65 @@
-//! Pseudo-legal + legal move generation, perft.
+//! Pseudo-legal + legal move generation over bitboards, perft.
+//!
+//! Generation order is type-major (pawns, knights, king, bishops, rooks,
+//! queens; targets ascending) rather than the old square-major order. Perft
+//! counts are order-independent; the stable move-ordering ties may break
+//! differently (reported per sub-step, judged by the self-play gate).
 
+use crate::bitboard::{
+    bishop_attacks, bit, king_attacks, knight_attacks, pop_lsb, queen_attacks, rook_attacks,
+};
 use crate::board::Board;
 use crate::types::*;
 
 pub fn generate_pseudo(board: &Board) -> Vec<Move> {
     let mut moves = Vec::with_capacity(64);
     let side = board.side;
-    for sq in 0..64u8 {
-        let piece = match board.squares[sq as usize] {
-            Some(p) if p.color == side => p,
-            _ => continue,
-        };
-        match piece.pt {
-            PieceType::Pawn => gen_pawn(board, sq, side, &mut moves),
-            PieceType::Knight => gen_stepper(board, sq, side, &KNIGHT_JUMPS, &mut moves),
-            PieceType::King => {
-                gen_stepper(board, sq, side, &KING_STEPS, &mut moves);
-                gen_castling(board, side, &mut moves);
-            }
-            PieceType::Bishop => gen_slider(board, sq, side, &DIAG, &mut moves),
-            PieceType::Rook => gen_slider(board, sq, side, &ORTH, &mut moves),
-            PieceType::Queen => {
-                gen_slider(board, sq, side, &DIAG, &mut moves);
-                gen_slider(board, sq, side, &ORTH, &mut moves);
-            }
-        }
+    let si = side.idx();
+    let free = !board.occ[si]; // empty or enemy
+                               // Pawns (scalar pushes/captures, ascending).
+    let mut bb = board.pieces[si][PieceType::Pawn.idx()];
+    while bb != 0 {
+        gen_pawn(board, pop_lsb(&mut bb), side, &mut moves);
+    }
+    // Knights.
+    let mut bb = board.pieces[si][PieceType::Knight.idx()];
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        push_set(&mut moves, sq, knight_attacks(sq) & free);
+    }
+    // King (+ castling).
+    let mut bb = board.pieces[si][PieceType::King.idx()];
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        push_set(&mut moves, sq, king_attacks(sq) & free);
+    }
+    gen_castling(board, side, &mut moves);
+    // Sliders.
+    let occ = board.occ_all;
+    let mut bb = board.pieces[si][PieceType::Bishop.idx()];
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        push_set(&mut moves, sq, bishop_attacks(sq, occ) & free);
+    }
+    let mut bb = board.pieces[si][PieceType::Rook.idx()];
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        push_set(&mut moves, sq, rook_attacks(sq, occ) & free);
+    }
+    let mut bb = board.pieces[si][PieceType::Queen.idx()];
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        push_set(&mut moves, sq, queen_attacks(sq, occ) & free);
     }
     moves
 }
 
-const KNIGHT_JUMPS: [(i8, i8); 8] = [
-    (1, 2),
-    (2, 1),
-    (2, -1),
-    (1, -2),
-    (-1, -2),
-    (-2, -1),
-    (-2, 1),
-    (-1, 2),
-];
-
-const KING_STEPS: [(i8, i8); 8] = [
-    (1, 1),
-    (1, 0),
-    (1, -1),
-    (0, 1),
-    (0, -1),
-    (-1, 1),
-    (-1, 0),
-    (-1, -1),
-];
-
-const DIAG: [(i8, i8); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
-const ORTH: [(i8, i8); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+/// Push one quiet move per set bit (targets ascending).
+fn push_set(moves: &mut Vec<Move>, from: u8, mut targets: u64) {
+    while targets != 0 {
+        moves.push(Move::new(from, pop_lsb(&mut targets), None));
+    }
+}
 
 fn push_pawn_move(moves: &mut Vec<Move>, from: u8, to: u8, promo_rank: bool) {
     if promo_rank {
@@ -76,16 +83,17 @@ fn gen_pawn(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) {
         Color::White => (1i8, 1i8, 7i8),
         Color::Black => (-1i8, 6i8, 0i8),
     };
+    let ei = side.opposite().idx();
     let one_r = r + dir;
     // Single + double push.
     if one_r >= 0 && one_r < 8 {
         let one = make_sq(f as u8, one_r as u8);
-        if board.squares[one as usize].is_none() {
+        if board.occ_all & bit(one) == 0 {
             push_pawn_move(moves, sq, one, one_r == promo_rank_next);
             if r == start_rank {
                 let two_r = r + 2 * dir;
                 let two = make_sq(f as u8, two_r as u8);
-                if board.squares[two as usize].is_none() {
+                if board.occ_all & bit(two) == 0 {
                     moves.push(Move::new(sq, two, None));
                 }
             }
@@ -99,56 +107,11 @@ fn gen_pawn(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) {
             continue;
         }
         let to = make_sq(nf as u8, nr as u8);
-        match board.squares[to as usize] {
-            Some(p) if p.color != side => {
-                push_pawn_move(moves, sq, to, nr == promo_rank_next);
-            }
-            _ => {
-                if Some(to) == board.ep {
-                    // EP capture is never a promotion (5th rank).
-                    moves.push(Move::new(sq, to, None));
-                }
-            }
-        }
-    }
-}
-
-fn gen_stepper(board: &Board, sq: u8, side: Color, deltas: &[(i8, i8)], moves: &mut Vec<Move>) {
-    let f = file_of(sq) as i8;
-    let r = rank_of(sq) as i8;
-    for (df, dr) in deltas {
-        let nf = f + df;
-        let nr = r + dr;
-        if nf < 0 || nf >= 8 || nr < 0 || nr >= 8 {
-            continue;
-        }
-        let to = make_sq(nf as u8, nr as u8);
-        match board.squares[to as usize] {
-            None => moves.push(Move::new(sq, to, None)),
-            Some(p) if p.color != side => moves.push(Move::new(sq, to, None)),
-            _ => {}
-        }
-    }
-}
-
-fn gen_slider(board: &Board, sq: u8, side: Color, deltas: &[(i8, i8)], moves: &mut Vec<Move>) {
-    let f = file_of(sq) as i8;
-    let r = rank_of(sq) as i8;
-    for (df, dr) in deltas {
-        let mut nf = f + df;
-        let mut nr = r + dr;
-        while nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
-            let to = make_sq(nf as u8, nr as u8);
-            match board.squares[to as usize] {
-                None => moves.push(Move::new(sq, to, None)),
-                Some(p) if p.color != side => {
-                    moves.push(Move::new(sq, to, None));
-                    break;
-                }
-                _ => break,
-            }
-            nf += df;
-            nr += dr;
+        if board.occ[ei] & bit(to) != 0 {
+            push_pawn_move(moves, sq, to, nr == promo_rank_next);
+        } else if Some(to) == board.ep {
+            // EP capture is never a promotion (5th rank).
+            moves.push(Move::new(sq, to, None));
         }
     }
 }
@@ -159,22 +122,37 @@ fn gen_slider(board: &Board, sq: u8, side: Color, deltas: &[(i8, i8)], moves: &m
 pub fn generate_pseudo_captures(board: &Board) -> Vec<Move> {
     let mut moves = Vec::with_capacity(16);
     let side = board.side;
-    for sq in 0..64u8 {
-        let piece = match board.squares[sq as usize] {
-            Some(p) if p.color == side => p,
-            _ => continue,
-        };
-        match piece.pt {
-            PieceType::Pawn => gen_pawn_captures(board, sq, side, &mut moves),
-            PieceType::Knight => gen_stepper_captures(board, sq, side, &KNIGHT_JUMPS, &mut moves),
-            PieceType::King => gen_stepper_captures(board, sq, side, &KING_STEPS, &mut moves),
-            PieceType::Bishop => gen_slider_captures(board, sq, side, &DIAG, &mut moves),
-            PieceType::Rook => gen_slider_captures(board, sq, side, &ORTH, &mut moves),
-            PieceType::Queen => {
-                gen_slider_captures(board, sq, side, &DIAG, &mut moves);
-                gen_slider_captures(board, sq, side, &ORTH, &mut moves);
-            }
-        }
+    let si = side.idx();
+    let enemy = board.occ[si ^ 1];
+    let mut bb = board.pieces[si][PieceType::Pawn.idx()];
+    while bb != 0 {
+        gen_pawn_captures(board, pop_lsb(&mut bb), side, &mut moves);
+    }
+    let mut bb = board.pieces[si][PieceType::Knight.idx()];
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        push_set(&mut moves, sq, knight_attacks(sq) & enemy);
+    }
+    let mut bb = board.pieces[si][PieceType::King.idx()];
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        push_set(&mut moves, sq, king_attacks(sq) & enemy);
+    }
+    let occ = board.occ_all;
+    let mut bb = board.pieces[si][PieceType::Bishop.idx()];
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        push_set(&mut moves, sq, bishop_attacks(sq, occ) & enemy);
+    }
+    let mut bb = board.pieces[si][PieceType::Rook.idx()];
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        push_set(&mut moves, sq, rook_attacks(sq, occ) & enemy);
+    }
+    let mut bb = board.pieces[si][PieceType::Queen.idx()];
+    while bb != 0 {
+        let sq = pop_lsb(&mut bb);
+        push_set(&mut moves, sq, queen_attacks(sq, occ) & enemy);
     }
     moves
 }
@@ -186,11 +164,12 @@ fn gen_pawn_captures(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) 
         Color::White => (1i8, 7i8),
         Color::Black => (-1i8, 0i8),
     };
+    let ei = side.opposite().idx();
     let one_r = r + dir;
     // Quiet promotion push (no capture) is still a "capture" for quiescence.
     if one_r >= 0 && one_r < 8 {
         let one = make_sq(f as u8, one_r as u8);
-        if board.squares[one as usize].is_none() && one_r == promo_rank_next {
+        if board.occ_all & bit(one) == 0 && one_r == promo_rank_next {
             push_pawn_move(moves, sq, one, true);
         }
     }
@@ -202,143 +181,45 @@ fn gen_pawn_captures(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) 
             continue;
         }
         let to = make_sq(nf as u8, nr as u8);
-        match board.squares[to as usize] {
-            Some(p) if p.color != side => {
-                push_pawn_move(moves, sq, to, nr == promo_rank_next);
-            }
-            _ => {
-                if Some(to) == board.ep {
-                    moves.push(Move::new(sq, to, None));
-                }
-            }
-        }
-    }
-}
-
-fn gen_stepper_captures(
-    board: &Board,
-    sq: u8,
-    side: Color,
-    deltas: &[(i8, i8)],
-    moves: &mut Vec<Move>,
-) {
-    let f = file_of(sq) as i8;
-    let r = rank_of(sq) as i8;
-    for (df, dr) in deltas {
-        let nf = f + df;
-        let nr = r + dr;
-        if nf < 0 || nf >= 8 || nr < 0 || nr >= 8 {
-            continue;
-        }
-        let to = make_sq(nf as u8, nr as u8);
-        match board.squares[to as usize] {
-            Some(p) if p.color != side => moves.push(Move::new(sq, to, None)),
-            _ => {}
-        }
-    }
-}
-
-fn gen_slider_captures(
-    board: &Board,
-    sq: u8,
-    side: Color,
-    deltas: &[(i8, i8)],
-    moves: &mut Vec<Move>,
-) {
-    let f = file_of(sq) as i8;
-    let r = rank_of(sq) as i8;
-    for (df, dr) in deltas {
-        let mut nf = f + df;
-        let mut nr = r + dr;
-        while nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
-            let to = make_sq(nf as u8, nr as u8);
-            match board.squares[to as usize] {
-                None => {}
-                Some(p) if p.color != side => {
-                    moves.push(Move::new(sq, to, None));
-                    break;
-                }
-                _ => break,
-            }
-            nf += df;
-            nr += dr;
+        if board.occ[ei] & bit(to) != 0 {
+            push_pawn_move(moves, sq, to, nr == promo_rank_next);
+        } else if Some(to) == board.ep {
+            moves.push(Move::new(sq, to, None));
         }
     }
 }
 
 /// Pseudo-legal destination count for one piece, for eval mobility.
-/// Counts quiet + capture destinations (mirrors the gen_* logic above;
-/// not legality-checked). Pawns, kings and empty squares count 0.
+/// Counts quiet + capture destinations via attack-set popcounts (not
+/// legality-checked). Pawns, kings and empty squares count 0.
 pub fn mobility_count(board: &Board, sq: u8) -> u32 {
     let (side, pt) = match board.squares[sq as usize] {
         Some(p) => (p.color, p.pt),
         None => return 0,
     };
+    let free = !board.occ[side.idx()];
     match pt {
-        PieceType::Knight => count_stepper(board, sq, side, &KNIGHT_JUMPS),
-        PieceType::Bishop => count_slider(board, sq, side, &DIAG),
-        PieceType::Rook => count_slider(board, sq, side, &ORTH),
-        PieceType::Queen => {
-            count_slider(board, sq, side, &DIAG) + count_slider(board, sq, side, &ORTH)
-        }
+        PieceType::Knight => (knight_attacks(sq) & free).count_ones(),
+        PieceType::Bishop => (bishop_attacks(sq, board.occ_all) & free).count_ones(),
+        PieceType::Rook => (rook_attacks(sq, board.occ_all) & free).count_ones(),
+        PieceType::Queen => (queen_attacks(sq, board.occ_all) & free).count_ones(),
         _ => 0,
     }
 }
 
-fn count_stepper(board: &Board, sq: u8, side: Color, deltas: &[(i8, i8)]) -> u32 {
-    let f = file_of(sq) as i8;
-    let r = rank_of(sq) as i8;
-    let mut n = 0u32;
-    for (df, dr) in deltas {
-        let nf = f + df;
-        let nr = r + dr;
-        if nf < 0 || nf >= 8 || nr < 0 || nr >= 8 {
-            continue;
-        }
-        match board.squares[make_sq(nf as u8, nr as u8) as usize] {
-            None => n += 1,
-            Some(p) if p.color != side => n += 1,
-            _ => {}
-        }
-    }
-    n
-}
-
-fn count_slider(board: &Board, sq: u8, side: Color, deltas: &[(i8, i8)]) -> u32 {
-    let f = file_of(sq) as i8;
-    let r = rank_of(sq) as i8;
-    let mut n = 0u32;
-    for (df, dr) in deltas {
-        let mut nf = f + df;
-        let mut nr = r + dr;
-        while nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
-            match board.squares[make_sq(nf as u8, nr as u8) as usize] {
-                None => n += 1,
-                Some(p) if p.color != side => {
-                    n += 1;
-                    break;
-                }
-                _ => break,
-            }
-            nf += df;
-            nr += dr;
-        }
-    }
-    n
-}
-
 fn gen_castling(board: &Board, side: Color, moves: &mut Vec<Move>) {
+    let si = side.idx();
+    let kings = board.pieces[si][PieceType::King.idx()];
+    let rooks = board.pieces[si][PieceType::Rook.idx()];
+    let occ = board.occ_all;
+    let empty = |sq: u8| occ & bit(sq) == 0;
     match side {
         Color::White => {
-            if board.squares[E1 as usize] != Some(Piece::new(PieceType::King, Color::White)) {
+            if kings & bit(E1) == 0 {
                 return;
             }
             // Kingside: f1, g1 empty; e1, f1, g1 not attacked.
-            if board.castling & WK != 0
-                && board.squares[5].is_none()
-                && board.squares[G1 as usize].is_none()
-                && board.squares[H1 as usize] == Some(Piece::new(PieceType::Rook, Color::White))
-            {
+            if board.castling & WK != 0 && empty(5) && empty(G1) && rooks & bit(H1) != 0 {
                 let b = Color::Black;
                 if !board.is_square_attacked(E1, b)
                     && !board.is_square_attacked(5, b)
@@ -348,11 +229,7 @@ fn gen_castling(board: &Board, side: Color, moves: &mut Vec<Move>) {
                 }
             }
             // Queenside: b1, c1, d1 empty; e1, d1, c1 not attacked.
-            if board.castling & WQ != 0
-                && board.squares[3].is_none()
-                && board.squares[C1 as usize].is_none()
-                && board.squares[1].is_none()
-                && board.squares[A1 as usize] == Some(Piece::new(PieceType::Rook, Color::White))
+            if board.castling & WQ != 0 && empty(3) && empty(C1) && empty(1) && rooks & bit(A1) != 0
             {
                 let b = Color::Black;
                 if !board.is_square_attacked(E1, b)
@@ -364,14 +241,10 @@ fn gen_castling(board: &Board, side: Color, moves: &mut Vec<Move>) {
             }
         }
         Color::Black => {
-            if board.squares[E8 as usize] != Some(Piece::new(PieceType::King, Color::Black)) {
+            if kings & bit(E8) == 0 {
                 return;
             }
-            if board.castling & BK != 0
-                && board.squares[61].is_none()
-                && board.squares[G8 as usize].is_none()
-                && board.squares[H8 as usize] == Some(Piece::new(PieceType::Rook, Color::Black))
-            {
+            if board.castling & BK != 0 && empty(61) && empty(G8) && rooks & bit(H8) != 0 {
                 let w = Color::White;
                 if !board.is_square_attacked(E8, w)
                     && !board.is_square_attacked(61, w)
@@ -381,10 +254,10 @@ fn gen_castling(board: &Board, side: Color, moves: &mut Vec<Move>) {
                 }
             }
             if board.castling & BQ != 0
-                && board.squares[59].is_none()
-                && board.squares[C8 as usize].is_none()
-                && board.squares[57].is_none()
-                && board.squares[A8 as usize] == Some(Piece::new(PieceType::Rook, Color::Black))
+                && empty(59)
+                && empty(C8)
+                && empty(57)
+                && rooks & bit(A8) != 0
             {
                 let w = Color::White;
                 if !board.is_square_attacked(E8, w)
