@@ -1,3 +1,4 @@
+mod bitboard;
 mod board;
 mod eval;
 mod movegen;
@@ -14,7 +15,10 @@ fn main() {
         match args[1].as_str() {
             "perft" => {
                 let depth: u32 = args.get(2).and_then(|d| d.parse().ok()).unwrap_or(4);
-                let fen = args.get(3).map(|s| s.as_str()).unwrap_or(board::STARTPOS_FEN);
+                let fen = args
+                    .get(3)
+                    .map(|s| s.as_str())
+                    .unwrap_or(board::STARTPOS_FEN);
                 let mut b = board::Board::from_fen(fen).expect("bad FEN");
                 let t = std::time::Instant::now();
                 let n = movegen::perft(&mut b, depth);
@@ -29,7 +33,10 @@ fn main() {
             "search" => {
                 // chess-engine search <depth> [fen] — direct search, no UCI loop.
                 let depth: u8 = args.get(2).and_then(|d| d.parse().ok()).unwrap_or(5);
-                let fen = args.get(3).map(|s| s.as_str()).unwrap_or(board::STARTPOS_FEN);
+                let fen = args
+                    .get(3)
+                    .map(|s| s.as_str())
+                    .unwrap_or(board::STARTPOS_FEN);
                 uci::search_cli(depth, fen);
                 return;
             }
