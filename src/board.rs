@@ -1,9 +1,35 @@
 //! Board representation (8x8 mailbox), FEN parsing, make/unmake,
 //! attack detection and draw detection. Zobrist hashing included.
 
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::OnceLock;
 
 use crate::types::*;
+
+/// Identity hasher for pre-hashed `u64` keys (Zobrist hashes): std's
+/// default SipHash would dominate the cost of the O(1) repetition lookup,
+/// so map operations use the key directly as the hash.
+#[derive(Default)]
+struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.wrapping_mul(31).wrapping_add(b as u64);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v;
+    }
+}
+
+type HashCounts = HashMap<u64, u32, BuildHasherDefault<IdentityHasher>>;
 
 // ---------------------------------------------------------------------------
 // Zobrist hashing (deterministic SplitMix64, no external crates)
@@ -82,6 +108,9 @@ pub struct Board {
     pub hash: u64,
     /// Hash of every position reached (initial + after each make, incl. nulls).
     pub hash_history: Vec<u64>,
+    /// Occurrence count per hash in `hash_history`, kept in sync by
+    /// make/unmake (incl. nulls) so repetition checks are O(1).
+    hash_counts: HashCounts,
 }
 
 pub const STARTPOS_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -177,9 +206,11 @@ impl Board {
             full,
             hash: 0,
             hash_history: Vec::new(),
+            hash_counts: HashCounts::default(),
         };
         b.hash = b.compute_hash();
         b.hash_history.push(b.hash);
+        b.hash_counts.insert(b.hash, 1);
         Ok(b)
     }
 
@@ -361,9 +392,7 @@ impl Board {
             let mut nr = r + dr;
             while nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
                 if let Some(p) = self.squares[(nr * 8 + nf) as usize] {
-                    if p.color == by
-                        && (p.pt == PieceType::Bishop || p.pt == PieceType::Queen)
-                    {
+                    if p.color == by && (p.pt == PieceType::Bishop || p.pt == PieceType::Queen) {
                         return true;
                     }
                     break;
@@ -379,8 +408,7 @@ impl Board {
             let mut nr = r + dr;
             while nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
                 if let Some(p) = self.squares[(nr * 8 + nf) as usize] {
-                    if p.color == by && (p.pt == PieceType::Rook || p.pt == PieceType::Queen)
-                    {
+                    if p.color == by && (p.pt == PieceType::Rook || p.pt == PieceType::Queen) {
                         return true;
                     }
                     break;
@@ -430,8 +458,9 @@ impl Board {
         debug_assert_eq!(mover.color, side);
 
         // Detect capture (before moving), including en passant.
-        let is_ep_capture =
-            mover.pt == PieceType::Pawn && Some(mv.to) == self.ep && self.squares[mv.to as usize].is_none();
+        let is_ep_capture = mover.pt == PieceType::Pawn
+            && Some(mv.to) == self.ep
+            && self.squares[mv.to as usize].is_none();
         let mut captured_sq = mv.to;
         if is_ep_capture {
             captured_sq = if side == Color::White {
@@ -462,7 +491,8 @@ impl Board {
         self.squares[mv.to as usize] = Some(placed);
 
         // Castling: king moved two squares -> move the rook.
-        if mover.pt == PieceType::King && (file_of(mv.from) as i8 - file_of(mv.to) as i8).abs() == 2 {
+        if mover.pt == PieceType::King && (file_of(mv.from) as i8 - file_of(mv.to) as i8).abs() == 2
+        {
             match mv.to {
                 x if x == G1 => {
                     self.squares[H1 as usize] = None;
@@ -485,8 +515,7 @@ impl Board {
         }
 
         // Pawn double push -> set EP square.
-        if mover.pt == PieceType::Pawn
-            && (rank_of(mv.from) as i8 - rank_of(mv.to) as i8).abs() == 2
+        if mover.pt == PieceType::Pawn && (rank_of(mv.from) as i8 - rank_of(mv.to) as i8).abs() == 2
         {
             self.ep = Some(if side == Color::White {
                 mv.from + 8
@@ -514,6 +543,7 @@ impl Board {
 
         self.hash = self.compute_hash();
         self.hash_history.push(self.hash);
+        *self.hash_counts.entry(self.hash).or_insert(0) += 1;
         undo
     }
 
@@ -521,6 +551,7 @@ impl Board {
         let mv = undo.mv.expect("unmake of null via unmake_move");
         // Pop current hash, restore.
         self.hash_history.pop();
+        self.decrement_count(self.hash);
         self.side = self.side.opposite();
         if self.side == Color::Black {
             self.full -= 1;
@@ -532,29 +563,24 @@ impl Board {
 
         // Undo castling rook move.
         let mover = self.squares[mv.to as usize].expect("unmake: no piece");
-        if mover.pt == PieceType::King
-            && (file_of(mv.from) as i8 - file_of(mv.to) as i8).abs() == 2
+        if mover.pt == PieceType::King && (file_of(mv.from) as i8 - file_of(mv.to) as i8).abs() == 2
         {
             match mv.to {
                 x if x == G1 => {
                     self.squares[5] = None;
-                    self.squares[H1 as usize] =
-                        Some(Piece::new(PieceType::Rook, self.side));
+                    self.squares[H1 as usize] = Some(Piece::new(PieceType::Rook, self.side));
                 }
                 x if x == C1 => {
                     self.squares[3] = None;
-                    self.squares[A1 as usize] =
-                        Some(Piece::new(PieceType::Rook, self.side));
+                    self.squares[A1 as usize] = Some(Piece::new(PieceType::Rook, self.side));
                 }
                 x if x == G8 => {
                     self.squares[61] = None;
-                    self.squares[H8 as usize] =
-                        Some(Piece::new(PieceType::Rook, self.side));
+                    self.squares[H8 as usize] = Some(Piece::new(PieceType::Rook, self.side));
                 }
                 x if x == C8 => {
                     self.squares[59] = None;
-                    self.squares[A8 as usize] =
-                        Some(Piece::new(PieceType::Rook, self.side));
+                    self.squares[A8 as usize] = Some(Piece::new(PieceType::Rook, self.side));
                 }
                 _ => {}
             }
@@ -593,11 +619,13 @@ impl Board {
         self.side = self.side.opposite();
         self.hash = self.compute_hash();
         self.hash_history.push(self.hash);
+        *self.hash_counts.entry(self.hash).or_insert(0) += 1;
         undo
     }
 
     pub fn unmake_null(&mut self, undo: Undo) {
         self.hash_history.pop();
+        self.decrement_count(self.hash);
         self.side = self.side.opposite();
         if self.side == Color::Black {
             self.full -= 1;
@@ -607,9 +635,24 @@ impl Board {
         self.hash = undo.hash;
     }
 
-    /// Occurrences of the current position hash in history.
+    /// Decrement the occurrence count of a hash being left via unmake.
+    /// Must be called with the current (about-to-be-popped) hash, before
+    /// `self.hash` is restored from the undo.
+    fn decrement_count(&mut self, hash: u64) {
+        match self.hash_counts.get_mut(&hash) {
+            Some(c) => {
+                *c -= 1;
+                if *c == 0 {
+                    self.hash_counts.remove(&hash);
+                }
+            }
+            None => debug_assert!(false, "hash_counts out of sync in unmake"),
+        }
+    }
+
+    /// Occurrences of the current position hash in history (O(1)).
     pub fn hash_count(&self) -> usize {
-        self.hash_history.iter().filter(|&&h| h == self.hash).count()
+        self.hash_counts.get(&self.hash).copied().unwrap_or(0) as usize
     }
 
     pub fn is_fifty_move(&self) -> bool {
@@ -683,4 +726,102 @@ fn castling_str(c: u8) -> String {
         s.push('q');
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn play(b: &mut Board, uci: &str) -> Undo {
+        let mv = Move::from_uci(uci).unwrap();
+        b.make_move(mv)
+    }
+
+    #[test]
+    fn make_unmake_round_trips_state() {
+        // Sequence covering captures, a null move, castling (rights change)
+        // and plain quiets; moves come from the legal set so the sequence
+        // is always valid.
+        use crate::movegen::generate_legal;
+        let mut b =
+            Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1")
+                .unwrap();
+        let fen0 = b.to_fen();
+        let (hash0, count0, hist0, map0) = (
+            b.hash,
+            b.hash_count(),
+            b.hash_history.len(),
+            b.hash_counts.len(),
+        );
+        let mut undos = Vec::new();
+        // A capture and its reply (victim present on the target square).
+        for _ in 0..2 {
+            let cap = generate_legal(&mut b)
+                .into_iter()
+                .find(|m| b.squares[m.to as usize].is_some())
+                .unwrap();
+            undos.push(b.make_move(cap));
+        }
+        undos.push(b.make_null());
+        // Castling when available (drops rights), else a quiet.
+        let castle = generate_legal(&mut b).into_iter().find(|m| {
+            b.squares[m.from as usize].is_some_and(|p| p.pt == PieceType::King)
+                && (file_of(m.from) as i8 - file_of(m.to) as i8).abs() == 2
+        });
+        match castle {
+            Some(mv) => undos.push(b.make_move(mv)),
+            None => {
+                let q = generate_legal(&mut b)[0];
+                undos.push(b.make_move(q));
+            }
+        }
+        for _ in 0..4 {
+            let mv = generate_legal(&mut b)[0];
+            undos.push(b.make_move(mv));
+        }
+        while let Some(u) = undos.pop() {
+            match u.mv {
+                Some(_) => b.unmake_move(u),
+                None => b.unmake_null(u),
+            }
+        }
+        assert_eq!(b.to_fen(), fen0);
+        assert_eq!(b.hash, hash0);
+        assert_eq!(b.hash_count(), count0);
+        assert_eq!(b.hash_history.len(), hist0);
+        assert_eq!(b.hash_counts.len(), map0);
+
+        // Promotion round-trip.
+        let mut p = Board::from_fen("8/2P2k2/8/8/8/8/5K2/8 w - - 0 1").unwrap();
+        let pfen = p.to_fen();
+        let u = play(&mut p, "c7c8q");
+        assert_eq!(p.hash_history.len(), 2);
+        p.unmake_move(u);
+        assert_eq!(p.to_fen(), pfen);
+        assert_eq!(p.hash_history.len(), 1);
+        assert_eq!(p.hash_counts.len(), 1);
+    }
+
+    #[test]
+    fn repetition_counts_incremental() {
+        let mut b = Board::new_startpos();
+        assert_eq!(b.hash_count(), 1);
+        // Knight dance out and back: startpos occurs twice.
+        for m in ["g1f3", "g8f6", "f3g1", "f6g8"] {
+            play(&mut b, m);
+        }
+        assert_eq!(b.hash_count(), 2);
+        assert!(!b.is_draw());
+        for m in ["g1f3", "g8f6", "f3g1", "f6g8"] {
+            play(&mut b, m);
+        }
+        assert_eq!(b.hash_count(), 3);
+        assert!(b.is_draw());
+        // Null moves participate in history and round-trip too.
+        let n = b.make_null();
+        assert_eq!(b.hash_history.len(), 10);
+        b.unmake_null(n);
+        assert_eq!(b.hash_count(), 3);
+        assert_eq!(b.hash_history.len(), 9);
+    }
 }
