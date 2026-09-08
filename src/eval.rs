@@ -180,6 +180,50 @@ fn knight_pst(sq: u8, color: Color, phase: i32) -> i32 {
     (mg * phase + eg * (24 - phase)) / 24
 }
 
+/// Pawn-shield score for one king (unscaled): own pawns on the three files
+/// around the king, one rank ahead (+8) or two ranks ahead (+4, still some
+/// cover). Only while the king is still home (back two ranks); a
+/// centralised endgame king has no shield to speak of. Cheap: 6 probes.
+fn king_shield(board: &Board, color: Color) -> i32 {
+    match board.king_sq(color) {
+        Some(ksq) => king_shield_sq(board, ksq, color),
+        None => 0,
+    }
+}
+
+/// Shield for a known king square (hot path: `evaluate` tracks kings in its
+/// first pass instead of re-scanning the board via `king_sq`).
+fn king_shield_sq(board: &Board, ksq: u8, color: Color) -> i32 {
+    let (kf, kr) = (file_of(ksq) as i8, rank_of(ksq) as i8);
+    let (home, dir) = match color {
+        Color::White => (kr <= 1, 1i8),
+        Color::Black => (kr >= 6, -1i8),
+    };
+    if !home {
+        return 0;
+    }
+    let mut s = 0;
+    for df in -1..=1 {
+        let f = kf + df;
+        if !(0..8).contains(&f) {
+            continue;
+        }
+        // kr is home-ranked, so r1/r2 stay on the board.
+        let r1 = (kr + dir) as u8;
+        let r2 = (kr + 2 * dir) as u8;
+        if board.squares[make_sq(f as u8, r1) as usize]
+            .is_some_and(|p| p.pt == PieceType::Pawn && p.color == color)
+        {
+            s += 8;
+        } else if board.squares[make_sq(f as u8, r2) as usize]
+            .is_some_and(|p| p.pt == PieceType::Pawn && p.color == color)
+        {
+            s += 4;
+        }
+    }
+    s
+}
+
 /// Development bonus from White's perspective: small reward for developed
 /// knights/bishops (not on starting squares) and for controlling central
 /// files/ranks. Signed by owner color (a developed black piece is good for
@@ -309,13 +353,17 @@ fn rook_bonus(color: Color, r: usize, f: usize, own: &[u8; 8], enemy: &[u8; 8]) 
 /// Material + middlegame PSTs, a tapered king table (shelter early, activity
 /// late), pawn structure (passed / isolated / doubled), rooks on open files
 /// and on the 7th rank, piece mobility (N/B/R/Q pseudo-legal move counts),
+/// king safety (pawn-shield presence, faded out in the endgame),
 /// plus a small bishop-pair bonus. All terms are symmetric, so the startpos
 /// still evaluates to exactly 0.
 pub fn evaluate(board: &Board) -> i32 {
-    // First pass: game phase + pawn locations per file (rank bitmasks).
+    // First pass: game phase + pawn locations per file (rank bitmasks) +
+    // king squares (tracked here so the shield term needs no extra scans).
     let mut phase = 0i32;
     let mut white_pawns = [0u8; 8];
     let mut black_pawns = [0u8; 8];
+    let mut white_king = None;
+    let mut black_king = None;
     for sq in 0..64u8 {
         if let Some(p) = board.squares[sq as usize] {
             phase += phase_weight(p.pt);
@@ -325,6 +373,11 @@ pub fn evaluate(board: &Board) -> i32 {
                 match p.color {
                     Color::White => white_pawns[f] |= 1 << r,
                     Color::Black => black_pawns[f] |= 1 << r,
+                }
+            } else if p.pt == PieceType::King {
+                match p.color {
+                    Color::White => white_king = Some(sq),
+                    Color::Black => black_king = Some(sq),
                 }
             }
         }
@@ -395,6 +448,11 @@ pub fn evaluate(board: &Board) -> i32 {
     if black_bishops >= 2 {
         score -= 30;
     }
+    // King safety: pawn-shield difference, full weight in the middlegame,
+    // fading out as pieces come off (phase scaling like the king PST).
+    let w_shield = white_king.map_or(0, |k| king_shield_sq(board, k, Color::White));
+    let b_shield = black_king.map_or(0, |k| king_shield_sq(board, k, Color::Black));
+    score += (w_shield - b_shield) * phase / 24;
     // Development / mobility: reward developed minors and center control.
     score += development_bonus(board);
     score
@@ -461,6 +519,38 @@ mod tests {
         // White Bd4, phase 1: 330 + bishop PST 19 + development 6 + 4
         // + mobility 13x2.
         assert_eq!(evaluate(&w), 385);
+    }
+
+    #[test]
+    fn pawn_shield_scores() {
+        // Startpos: both kings fully shielded (3 files x 8).
+        let b = Board::new_startpos();
+        assert_eq!(king_shield(&b, Color::White), 24);
+        assert_eq!(king_shield(&b, Color::Black), 24);
+        // Kg1 + f2/g2/h2: full shield; h-pawn traded: 16.
+        let full = Board::from_fen("7k/8/8/8/8/8/5PPP/6K1 w - - 0 1").unwrap();
+        assert_eq!(king_shield(&full, Color::White), 24);
+        let traded = Board::from_fen("7k/8/8/8/8/8/5PP1/6K1 w - - 0 1").unwrap();
+        assert_eq!(king_shield(&traded, Color::White), 16);
+        // Pushed f-pawn (f3, f2 empty) still half-covers: 4 + 8 + 8.
+        let pushed = Board::from_fen("7k/8/8/8/8/5P2/6PP/6K1 w - - 0 1").unwrap();
+        assert_eq!(king_shield(&pushed, Color::White), 20);
+        // Centralised king: no shield term; missing king: 0.
+        let mid = Board::from_fen("4k3/8/8/8/4K3/8/8/8 w - - 0 1").unwrap();
+        assert_eq!(king_shield(&mid, Color::White), 0);
+        // Black mirror: Kg8 + f7/g7/h7.
+        let b = Board::from_fen("6k1/5ppp/8/8/8/8/8/6K1 w - - 0 1").unwrap();
+        assert_eq!(king_shield(&b, Color::Black), 24);
+    }
+
+    #[test]
+    fn shield_intact_beats_shield_traded() {
+        // Symmetric castled middlegame (R + K + 3 shield pawns each): 0.
+        let even = Board::from_fen("r5k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1").unwrap();
+        assert_eq!(evaluate(&even), 0);
+        // White's h-pawn traded away: material + shield favor Black.
+        let cracked = Board::from_fen("r5k1/5ppp/8/8/8/8/5PP1/R5K1 w - - 0 1").unwrap();
+        assert!(evaluate(&cracked) < -50);
     }
 
     #[test]
