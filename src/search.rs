@@ -63,7 +63,7 @@ impl Limits {
 }
 
 // ---------------------------------------------------------------------------
-// Transposition table (fixed-size hash table, always-replace)
+// Transposition table (fixed-size hash table, depth-preferred replacement)
 // ---------------------------------------------------------------------------
 
 #[derive(Copy, Clone)]
@@ -121,13 +121,27 @@ impl TT {
     }
 
     fn store(&mut self, key: u64, best: Option<Move>, score: i32, depth: u8, flag: u8) {
-        self.slots[(key as usize) & self.mask] = Some(Entry {
-            key,
-            best,
-            score,
-            depth,
-            flag,
-        });
+        // Depth-preferred replacement: keep the deeper entry for the same
+        // position so a shallow search can't evict valuable deep results.
+        // Empty slots and key collisions (different position) always store.
+        // (No generation aging yet: a per-search generation byte would mark
+        // the previous move's still-useful entries stale, so age-aware
+        // replacement is left for a later pass.)
+        let idx = (key as usize) & self.mask;
+        let replace = match self.slots[idx] {
+            None => true,
+            Some(e) if e.key != key => true,
+            Some(e) => depth >= e.depth,
+        };
+        if replace {
+            self.slots[idx] = Some(Entry {
+                key,
+                best,
+                score,
+                depth,
+                flag,
+            });
+        }
     }
 }
 
