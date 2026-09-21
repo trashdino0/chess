@@ -100,6 +100,11 @@ const KING_EG: [i32; 64] = [
 /// 1st/8th rank, so the endpoints stay 0.
 const PASSED_BONUS: [i32; 8] = [0, 0, 10, 20, 35, 60, 100, 0];
 
+/// Side-to-move bonus: moving first is worth roughly a tenth of a pawn.
+/// Applied in `evaluate` (not `side_eval`) so the `eval` UCI command shows
+/// it; symmetry tests must mirror the side to move as well as the pieces.
+const TEMPO: i32 = 12;
+
 /// Mobility weights in centipawns per pseudo-legal destination
 /// (knights/bishops/rooks/queens only; pawns and kings are covered by
 /// structure/safety terms). Kept small: mobility guides, never dominates.
@@ -136,6 +141,46 @@ const KNIGHT_EG: [i32; 64] = [
     -50, -40, -30, -30, -30, -30, -40, -50, -40, -20, 0, 5, 5, 0, -20, -40, -30, 0, 10, 15, 15, 10,
     0, -30, -30, 5, 15, 20, 20, 15, 5, -30, -30, 5, 15, 20, 20, 15, 5, -30, -30, 0, 10, 15, 15, 10,
     0, -30, -40, -20, 0, 5, 5, 0, -20, -40, -50, -40, -30, -30, -30, -30, -40, -50,
+];
+
+/// Endgame pawn table (rank8-first, White perspective): advanced (central)
+/// pawns are worth more with few pieces left; unadvanced flank pawns are
+/// slight liabilities.
+const PAWN_EG: [i32; 64] = [
+    0, 0, 0, 0, 0, 0, 0, 0, //
+    10, 10, 10, 10, 10, 10, 10, 10, //
+    20, 20, 20, 20, 20, 20, 20, 20, //
+    15, 15, 25, 30, 30, 25, 15, 15, //
+    5, 5, 15, 25, 25, 15, 5, 5, //
+    0, 0, 5, 15, 15, 5, 0, 0, //
+    -5, -5, -5, 0, 0, -5, -5, -5, //
+    0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Endgame rook table (rank8-first, White perspective): centralize the rook
+/// once the board empties; 7th-rank activity still scores.
+const ROOK_EG: [i32; 64] = [
+    0, 0, 0, 5, 5, 0, 0, 0, //
+    -5, 0, 0, 0, 0, 0, 0, -5, //
+    -5, 0, 0, 0, 0, 0, 0, -5, //
+    -5, 0, 0, 0, 0, 0, 0, -5, //
+    -5, 0, 0, 0, 0, 0, 0, -5, //
+    -5, 0, 0, 0, 0, 0, 0, -5, //
+    5, 10, 10, 10, 10, 10, 10, 5, //
+    0, 0, 0, 5, 5, 0, 0, 0,
+];
+
+/// Endgame queen table (rank8-first, White perspective): mild centralization
+/// vs the middlegame table.
+const QUEEN_EG: [i32; 64] = [
+    -20, -10, -10, -5, -5, -10, -10, -20, //
+    -10, 0, 5, 0, 0, 0, 0, -10, //
+    -10, 5, 5, 5, 5, 5, 0, -10, //
+    0, 5, 5, 5, 5, 5, 0, -5, //
+    0, 0, 5, 5, 5, 5, 0, -5, //
+    -10, 0, 5, 5, 5, 5, 0, -10, //
+    -10, 0, 0, 0, 0, 0, 0, -10, //
+    -20, -10, -10, -5, -5, -10, -10, -20,
 ];
 
 /// Game-phase weights (N/B = 1, R = 2, Q = 4; K and pawns = 0; max 24).
