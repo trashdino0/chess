@@ -564,12 +564,23 @@ impl Searcher {
                 best_score = sc;
                 best = mv;
             }
+            let failed_low = sc <= alpha;
             if sc > alpha {
                 alpha = sc;
             }
             if alpha >= beta {
                 self.note_cutoff(board.side, mv, board, 0, depth);
                 break;
+            }
+            // History gravity: a quiet move that failed low loses points, so
+            // stale history can't outrank newly-good moves forever.
+            // (Post-unmake occupancy is the pre-move state, matching
+            // `note_cutoff`'s quiet check.)
+            let quiet = board.occ_all & bit(mv.to) == 0
+                && Some(mv.to) != board.ep
+                && mv.promotion.is_none();
+            if quiet && failed_low {
+                self.history_malus(board.side, mv, depth);
             }
         }
         Ok((best_score, best))
@@ -760,12 +771,20 @@ impl Searcher {
                 best_score = sc;
                 best_move = Some(mv);
             }
+            let failed_low = sc <= alpha;
             if sc > alpha {
                 alpha = sc;
             }
             if alpha >= beta {
                 self.note_cutoff(board.side, mv, board, ply, depth);
                 break;
+            }
+            // History gravity: a quiet move that failed low loses points, so
+            // stale history can't outrank newly-good moves forever.
+            // (`is_cap` was computed pre-move; killers are quiet by
+            // construction and take the malus like any other quiet.)
+            if !is_cap && failed_low && ply < MAX_PLY {
+                self.history_malus(board.side, mv, depth);
             }
         }
 
@@ -895,6 +914,13 @@ impl Searcher {
                 self.counter[pm.from as usize][pm.to as usize] = Some(mv);
             }
         }
+    }
+
+    /// History gravity: quiet fail-lows decay toward `-1_000_000`, mirroring
+    /// the `+depth²` bonus (clamped at `+1_000_000`) in `note_cutoff`.
+    fn history_malus(&mut self, side: Color, mv: Move, depth: i32) {
+        let h = &mut self.history[side.idx()][mv.from as usize][mv.to as usize];
+        *h = (*h - depth * depth).max(-1_000_000);
     }
 
     fn print_info(&mut self, board: &mut Board, depth: u8, score: i32, start: &Instant) {
