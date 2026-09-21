@@ -193,24 +193,38 @@ fn phase_weight(pt: PieceType) -> i32 {
     }
 }
 
-/// PST value from the piece owner's perspective (positive = good for owner).
-/// Tables are rank8-first; White reads them directly, Black reads the
-/// vertically mirrored square.
-fn pst_own(pt: PieceType, sq: u8, color: Color) -> i32 {
+/// Tapered pawn (middlegame → endgame). Endgame rewards advanced central
+/// pawns; unadvanced flank pawns score slightly negative.
+fn pawn_pst(sq: u8, color: Color, phase: i32) -> i32 {
     let r = rank_of(sq) as usize;
     let f = file_of(sq) as usize;
-    let table = match pt {
-        PieceType::Pawn => &PAWN,
-        PieceType::Knight => &KNIGHT,
-        PieceType::Bishop => &BISHOP,
-        PieceType::Rook => &ROOK,
-        PieceType::Queen => &QUEEN,
-        PieceType::King => &KING_MG,
+    let (mg, eg) = match color {
+        Color::White => (PAWN[(7 - r) * 8 + f], PAWN_EG[(7 - r) * 8 + f]),
+        Color::Black => (PAWN[r * 8 + f], PAWN_EG[r * 8 + f]),
     };
-    match color {
-        Color::White => table[(7 - r) * 8 + f],
-        Color::Black => table[r * 8 + f],
-    }
+    (mg * phase + eg * (24 - phase)) / 24
+}
+
+/// Tapered rook (middlegame → endgame). Endgame centralizes the rook.
+fn rook_pst(sq: u8, color: Color, phase: i32) -> i32 {
+    let r = rank_of(sq) as usize;
+    let f = file_of(sq) as usize;
+    let (mg, eg) = match color {
+        Color::White => (ROOK[(7 - r) * 8 + f], ROOK_EG[(7 - r) * 8 + f]),
+        Color::Black => (ROOK[r * 8 + f], ROOK_EG[r * 8 + f]),
+    };
+    (mg * phase + eg * (24 - phase)) / 24
+}
+
+/// Tapered queen (middlegame → endgame). Endgame mildly centralizes.
+fn queen_pst(sq: u8, color: Color, phase: i32) -> i32 {
+    let r = rank_of(sq) as usize;
+    let f = file_of(sq) as usize;
+    let (mg, eg) = match color {
+        Color::White => (QUEEN[(7 - r) * 8 + f], QUEEN_EG[(7 - r) * 8 + f]),
+        Color::Black => (QUEEN[r * 8 + f], QUEEN_EG[r * 8 + f]),
+    };
+    (mg * phase + eg * (24 - phase)) / 24
 }
 
 /// Tapered bishop (middlegame → endgame). Endgame table favors central diagonals.
@@ -442,13 +456,14 @@ fn rook_bonus(color: Color, r: usize, f: usize, own: &[u8; 8], enemy: &[u8; 8]) 
 
 /// Static evaluation in centipawns from White's perspective.
 ///
-/// Material + middlegame PSTs, a tapered king table (shelter early, activity
-/// late), pawn structure (passed / isolated / doubled, passers scored by king
-/// distance to promotion), rooks on open files
-/// and on the 7th rank, piece mobility (N/B/R/Q pseudo-legal move counts),
-/// king safety (pawn-shield presence, faded out in the endgame),
-/// plus a small bishop-pair bonus. All terms are symmetric, so the startpos
-/// still evaluates to exactly 0.
+/// Material + tapered PSTs (middlegame → endgame for every piece; king
+/// shelters early, activates late), pawn structure (passed / isolated /
+/// doubled, passers scored by king distance to promotion), rooks on open
+/// files and on the 7th rank, piece mobility (N/B/R/Q pseudo-legal move
+/// counts), king safety (pawn-shield presence, faded out in the endgame),
+/// plus a small bishop-pair bonus and a side-to-move tempo bonus. All
+/// terms are symmetric, so symmetric positions differ only by the tempo
+/// term (startpos evaluates to exactly TEMPO).
 pub fn evaluate(board: &Board) -> i32 {
     // First pass: game phase + pawn locations per file (rank bitmasks) +
     // king squares (tracked here so the shield term needs no extra scans).
@@ -500,13 +515,15 @@ pub fn evaluate(board: &Board) -> i32 {
                 }
                 let r = rank_of(sq) as usize;
                 let f = file_of(sq) as usize;
-                // Bishop and knight use tapered tables; others use fixed PST.
-                let mut u = if pt == PieceType::Bishop {
-                    pt.value() + bishop_pst(sq, color, phase)
-                } else if pt == PieceType::Knight {
-                    pt.value() + knight_pst(sq, color, phase)
-                } else {
-                    pt.value() + pst_own(pt, sq, color)
+                // All piece tables taper middlegame → endgame; kings use
+                // the dedicated tapered table below.
+                let mut u = match pt {
+                    PieceType::Pawn => pt.value() + pawn_pst(sq, color, phase),
+                    PieceType::Knight => pt.value() + knight_pst(sq, color, phase),
+                    PieceType::Bishop => pt.value() + bishop_pst(sq, color, phase),
+                    PieceType::Rook => pt.value() + rook_pst(sq, color, phase),
+                    PieceType::Queen => pt.value() + queen_pst(sq, color, phase),
+                    PieceType::King => unreachable!("kings use king_pst above"),
                 };
                 match pt {
                     PieceType::Pawn => {
@@ -555,6 +572,12 @@ pub fn evaluate(board: &Board) -> i32 {
     score += (w_shield - b_shield) * phase / 24;
     // Development / mobility: reward developed minors and center control.
     score += development_bonus(board);
+    // Tempo: side to move gets a small bonus (White-perspective signed, so
+    // `side_eval` always credits the mover).
+    score += match board.side {
+        Color::White => TEMPO,
+        Color::Black => -TEMPO,
+    };
     score
 }
 
@@ -564,8 +587,12 @@ mod tests {
 
     #[test]
     fn startpos_is_balanced() {
+        // Symmetric material: only the side-to-move tempo term scores.
         let b = Board::new_startpos();
-        assert_eq!(evaluate(&b), 0);
+        assert_eq!(evaluate(&b), TEMPO);
+        let b =
+            Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1").unwrap();
+        assert_eq!(evaluate(&b), -TEMPO);
     }
 
     #[test]
@@ -576,7 +603,7 @@ mod tests {
 
     #[test]
     fn passed_pawn_beats_blocked_pawn() {
-        // e6 with no black pawns left: passed, PST 25 + bonus 60.
+        // e6 with no black pawns left: passed, EG PST 20 + bonus 60.
         let free = Board::from_fen("4k3/8/4P3/8/8/8/4K3/8 w - - 0 1").unwrap();
         // e6 blocked by a black pawn on e7: not passed.
         let blocked = Board::from_fen("4k3/4p3/4P3/8/8/8/4K3/8 w - - 0 1").unwrap();
@@ -585,7 +612,7 @@ mod tests {
 
     #[test]
     fn isolated_pawn_is_penalized() {
-        // Lone a-pawn: PST 5, isolated -12 -> below bare material.
+        // Lone a-pawn (phase 0): EG PST -5, isolated -12 -> below bare material.
         let b = Board::from_fen("4k3/8/8/8/8/8/P7/4K3 w - - 0 1").unwrap();
         let e = evaluate(&b);
         assert!(e < 100 && e > 50, "isolated pawn scored {e}");
@@ -609,16 +636,17 @@ mod tests {
 
     #[test]
     fn eval_is_color_symmetric() {
-        // Vertical mirror with colors flipped must negate exactly: every
-        // term (material, PSTs, development) is owner-perspective signed.
+        // Vertical mirror with colors AND side to move flipped must negate
+        // exactly: every term (material, PSTs, development) is
+        // owner-perspective signed and tempo follows the mover.
         // (Catches the old development_bonus bug, which credited Black's
-        // development to White; startpos == 0 masked it.)
+        // development to White; startpos == TEMPO masked it.)
         let w = Board::from_fen("4k3/8/8/8/3B4/8/8/4K3 w - - 0 1").unwrap();
-        let b = Board::from_fen("4k3/8/8/3b4/8/8/8/4K3 w - - 0 1").unwrap();
+        let b = Board::from_fen("4k3/8/8/3b4/8/8/8/4K3 b - - 0 1").unwrap();
         assert_eq!(evaluate(&w), -evaluate(&b));
         // White Bd4, phase 1: 330 + bishop PST 19 + development 6 + 4
-        // + mobility 13x2.
-        assert_eq!(evaluate(&w), 385);
+        // + mobility 13x2 + tempo 12.
+        assert_eq!(evaluate(&w), 397);
     }
 
     #[test]
@@ -645,9 +673,10 @@ mod tests {
 
     #[test]
     fn shield_intact_beats_shield_traded() {
-        // Symmetric castled middlegame (R + K + 3 shield pawns each): 0.
+        // Symmetric castled middlegame (R + K + 3 shield pawns each):
+        // material cancels, only tempo scores.
         let even = Board::from_fen("r5k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1").unwrap();
-        assert_eq!(evaluate(&even), 0);
+        assert_eq!(evaluate(&even), TEMPO);
         // White's h-pawn traded away: material + shield favor Black.
         let cracked = Board::from_fen("r5k1/5ppp/8/8/8/8/5PP1/R5K1 w - - 0 1").unwrap();
         assert!(evaluate(&cracked) < -50);
@@ -701,8 +730,8 @@ mod tests {
         // Ke1 + Na1 vs Ke8, phase 1: material 320, knight PST -50
         // (corner in both MG and EG tables), mobility 2 moves x 2 = 4,
         // kings cancel (both tapered to -28), knight undeveloped (no dev
-        // bonus). Total: 320 - 50 + 4 = 274 (270 without the term).
+        // bonus), tempo +12. Total: 320 - 50 + 4 + 12 = 286.
         let b = Board::from_fen("4k3/8/8/8/8/8/8/N3K3 w - - 0 1").unwrap();
-        assert_eq!(evaluate(&b), 274);
+        assert_eq!(evaluate(&b), 286);
     }
 }
