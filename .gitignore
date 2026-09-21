@@ -1,1 +1,6 @@
 /target
+/cutechess-1.5.1-win64/
+/stockfish/
+benchmarks/*.pgn
+benchmarks/*.log
+plan.md
