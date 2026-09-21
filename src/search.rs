@@ -549,17 +549,26 @@ impl Searcher {
         for (i, &mv) in moves.iter().enumerate() {
             self.stack[0] = Some(mv);
             let undo = board.make_move(mv);
+            // Unmake runs before `?` can propagate: aborts unwind through
+            // here, and every `make` must meet its `unmake` so the board is
+            // never left dirty (same pattern at every search call site).
             let sc = if i == 0 {
-                -self.negamax(board, depth - 1, -beta, -alpha, 1, true, poll)?
+                let res = self.negamax(board, depth - 1, -beta, -alpha, 1, true, poll);
+                board.unmake_move(undo);
+                -res?
             } else {
                 // Principal variation search: null window first.
-                let mut sc = -self.negamax(board, depth - 1, -alpha - 1, -alpha, 1, true, poll)?;
-                if sc > alpha && sc < beta {
-                    sc = -self.negamax(board, depth - 1, -beta, -alpha, 1, true, poll)?;
-                }
-                sc
+                let res = (|| -> Result<i32, Abort> {
+                    let mut sc =
+                        -self.negamax(board, depth - 1, -alpha - 1, -alpha, 1, true, poll)?;
+                    if sc > alpha && sc < beta {
+                        sc = -self.negamax(board, depth - 1, -beta, -alpha, 1, true, poll)?;
+                    }
+                    Ok(sc)
+                })();
+                board.unmake_move(undo);
+                res?
             };
-            board.unmake_move(undo);
             if sc > best_score {
                 best_score = sc;
                 best = mv;
@@ -675,8 +684,9 @@ impl Searcher {
             let r = 2 + (depth > 6) as i32;
             let undo = board.make_null();
             self.stack[ply] = None; // null move: no countermove info below
-            let sc = -self.negamax(board, depth - 1 - r, -beta, -beta + 1, ply + 1, false, poll)?;
+            let res = self.negamax(board, depth - 1 - r, -beta, -beta + 1, ply + 1, false, poll);
             board.unmake_null(undo);
+            let sc = -res?;
             if sc >= beta && sc.abs() < MATE_BOUND {
                 return Ok(beta);
             }
@@ -742,30 +752,42 @@ impl Searcher {
             self.stack[ply] = Some(mv);
             let undo = board.make_move(mv);
             // Late move reduction for quiet moves ordered late (never killers).
-            let mut sc;
-            if i >= 3 && depth >= 3 && !is_cap && !is_killer && !in_check {
+            // (Unmake-before-`?` as in root_search: aborts never dirty the board.)
+            let sc = if i >= 3 && depth >= 3 && !is_cap && !is_killer && !in_check {
                 let r = if depth >= 6 && i >= 8 { 2 } else { 1 };
-                sc = -self.negamax(
-                    board,
-                    depth - 1 - r,
-                    -alpha - 1,
-                    -alpha,
-                    ply + 1,
-                    true,
-                    poll,
-                )?;
-                if sc > alpha {
-                    sc = -self.negamax(board, depth - 1, -beta, -alpha, ply + 1, true, poll)?;
-                }
+                let res = (|| -> Result<i32, Abort> {
+                    let mut sc = -self.negamax(
+                        board,
+                        depth - 1 - r,
+                        -alpha - 1,
+                        -alpha,
+                        ply + 1,
+                        true,
+                        poll,
+                    )?;
+                    if sc > alpha {
+                        sc = -self.negamax(board, depth - 1, -beta, -alpha, ply + 1, true, poll)?;
+                    }
+                    Ok(sc)
+                })();
+                board.unmake_move(undo);
+                res?
             } else if i == 0 {
-                sc = -self.negamax(board, depth - 1, -beta, -alpha, ply + 1, true, poll)?;
+                let res = self.negamax(board, depth - 1, -beta, -alpha, ply + 1, true, poll);
+                board.unmake_move(undo);
+                -res?
             } else {
-                sc = -self.negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1, true, poll)?;
-                if sc > alpha && sc < beta {
-                    sc = -self.negamax(board, depth - 1, -beta, -alpha, ply + 1, true, poll)?;
-                }
-            }
-            board.unmake_move(undo);
+                let res = (|| -> Result<i32, Abort> {
+                    let mut sc =
+                        -self.negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1, true, poll)?;
+                    if sc > alpha && sc < beta {
+                        sc = -self.negamax(board, depth - 1, -beta, -alpha, ply + 1, true, poll)?;
+                    }
+                    Ok(sc)
+                })();
+                board.unmake_move(undo);
+                res?
+            };
 
             if sc > best_score {
                 best_score = sc;
@@ -870,8 +892,9 @@ impl Searcher {
                 self.stack[ply] = Some(mv);
             }
             let undo = board.make_move(mv);
-            let sc = -self.quiescence(board, -beta, -alpha, ply + 1, poll)?;
+            let res = self.quiescence(board, -beta, -alpha, ply + 1, poll);
             board.unmake_move(undo);
+            let sc = -res?;
             if sc > alpha {
                 alpha = sc;
             }
@@ -1214,6 +1237,40 @@ mod tests {
                 assert_eq!(e.score, i as i32 - 500);
                 assert_eq!(e.depth, 6);
             }
+        }
+    }
+
+    #[test]
+    fn abort_leaves_board_intact() {
+        // P0.1: every `make` must meet its `unmake` on ALL paths, including
+        // abort. Let two consultations pass (covers a clean
+        // between-iteration stop), then abort: the third consultation always
+        // lands mid-iteration (a tick check at a 1024-node multiple), where
+        // the unwound path must still unmake. Counting consultations (not
+        // nodes) keeps this deterministic single-threaded.
+        let tt = TT::new(1);
+        let lim = Limits {
+            depth: Some(20),
+            ..Default::default()
+        };
+        for fen in [
+            crate::board::STARTPOS_FEN,
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        ] {
+            let mut board = crate::board::Board::from_fen(fen).expect("valid fen");
+            let fen0 = board.to_fen();
+            let consults = std::cell::Cell::new(0);
+            let mut abort_mid_search = || {
+                let n = consults.get() + 1;
+                consults.set(n);
+                n >= 3
+            };
+            let res = search_root(&mut board, &tt, &lim, 1, &mut abort_mid_search);
+            // Aborted before completing depth 1: previous-iteration fallback
+            // (root_moves[0]), still a legal move from the true position.
+            let mv = res.best.expect("fallback move");
+            assert!(crate::movegen::generate_legal(&mut board).contains(&mv));
+            assert_eq!(board.to_fen(), fen0, "aborted search mutated the board");
         }
     }
 }
