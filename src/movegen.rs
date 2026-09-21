@@ -130,7 +130,7 @@ fn ep_capture_ok(board: &Board, to: u8, side: Color) -> bool {
         Color::White => to.checked_sub(8),
         Color::Black => to.checked_add(8),
     };
-    behind.map_or(false, |sq| {
+    behind.is_some_and(|sq| {
         board
             .piece_at(sq)
             .is_some_and(|p| p.color == side.opposite() && p.pt == PieceType::Pawn)

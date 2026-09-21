@@ -35,8 +35,8 @@ Or use a GUI (Cutechess / Arena) that manages the process properly.
 - `Move` = `{from: u8, to: u8, promotion: Option<PieceType>}`. Castling / EP / double-push inferred inside `make_move` — never add flags to `Move`.
 - Board: per-color/per-piece bitboards (`pieces[[u64;6];2]` + `occ[2]` + `occ_all`), FEN parse/generate, Zobrist hashing (`SplitMix64`), undo stack (`Undo`), 50-move / repetition (O(1) `hash_counts` map synced in make/unmake) / insufficient-material draw detection.
 - Movegen: pseudo-legal (`generate_pseudo`) then legal (`generate_legal` via make/unmake + `in_check`). Quiescence uses direct capture-only generation (`generate_pseudo_captures`). Perft verified against standard positions.
-- Eval (`src/eval.rs`): material + tapered piece-square tables (middlegame/endgame interpolation for King; middgame PST for others), pawn structure (passed/isolated/doubled, passers scored by king distance to promotion), rook open/semi-open + 7th-rank bonus, N/B/R/Q mobility, pawn-shield king safety (faded out in the endgame), bishop-pair bonus. All terms symmetric (color-mirrored positions negate exactly); startpos evaluates to `0`.
-- Search (`src/search.rs`): iterative deepening, aspiration windows (from depth 4, with widening on fail-high/low), lock-free shared transposition table (atomics + xor checksum, depth-preferred replacement), Lazy SMP via the `Threads` option (helpers on staggered depths, deepest result wins), null-move pruning (depth >=3, not in check, non-pawn material), internal iterative reduction (depth >=6, no hash move), check extension (capped at depth +1), quiescence with delta pruning (promotions/search-captures only; captures skipped if victim + static_eval + 150 <= alpha), late-move pruning (skip very late quiet non-killer moves near leaves), killer + countermove + history move ordering, MVV-LVA capture ordering.
+- Eval (`src/eval.rs`): material + tapered piece-square tables for every piece (middlegame/endgame interpolation driven by game phase; king shelters early, activates late), pawn structure (passed/isolated/doubled, passers scored by king distance to promotion), rook open/semi-open + 7th-rank bonus, N/B/R/Q mobility, pawn-shield king safety (faded out in the endgame), bishop-pair bonus, side-to-move tempo. All terms symmetric (color-mirrored positions negate exactly); startpos evaluates to `TEMPO` (12).
+- Search (`src/search.rs`): iterative deepening, aspiration windows (from depth 4, with widening on fail-high/low), lock-free shared transposition table (atomics + xor checksum, depth-preferred replacement), Lazy SMP via the `Threads` option (helpers on staggered depths, deepest result wins), null-move pruning (depth >=3, not in check, non-pawn material), internal iterative reduction (depth >=6, no hash move), check extension (capped at depth +1), quiescence with delta pruning (promotions/search-captures only; captures skipped if victim + static_eval + 150 <= alpha), late-move pruning (skip very late quiet non-killer moves near leaves), LMR (reduce late quiets 1–2 ply with re-search on alpha exceed), killer + countermove + history move ordering (history bonus for cutoff quiets, gravity malus for quiet fail-lows), MVV-LVA capture ordering.
 - UCI (`uci.rs`): stdin-reader thread forwards lines over `mpsc`; `go` runs on main thread with periodic `poll()` checking the channel for `stop`/`quit`. `isready` deferred mid-search flushed after `go`. Options: `Hash` (MB), `Threads` (1–256, default 1).
 
 ## Benchmark / test helpers
@@ -46,7 +46,7 @@ Or use a GUI (Cutechess / Arena) that manages the process properly.
   ```
   cutechess-cli.exe -engine cmd=... -each st=0.2 -games 48 -openings file=openings.epd format=epd order=random -draw movenumber=40 movecount=8 score=10 -resign movecount=4 score=800 -maxmoves 150 -concurrency 2 -pgnout out.pgn
   ```
-- Note: `benchmarks/openings.epd` is clean (no comment lines) to avoid cutechess EPD parse warnings.
+- Note: `benchmarks/openings.epd` is clean (no comment lines) to avoid cutechess EPD parse warnings. One line is a synthetic French position with a stale EP square (no capturable pawn) — kept deliberately as regression coverage for phantom-EP generation (see `stale_ep_square_emits_no_phantom_capture`).
 
 ## Key files
 
@@ -55,7 +55,7 @@ Or use a GUI (Cutechess / Arena) that manages the process properly.
 - `src/types.rs`: colors, piece types, square indexing (`0 = a1`), castling rights bits (`WK`, `WQ`, `BK`, `BQ`).
 - `src/board.rs`: bitboard board, FEN, Zobrist (`OnceLock<Tables>`), `make_move`/`unmake_move`/`make_null`, `is_square_attacked`, `in_check`, `is_draw`, `pretty()`.
 - `src/movegen.rs`: pseudo-legal + legal generation, castling, promotion, `perft()`.
-- `src/eval.rs`: PSTs (`PAWN`, `KNIGHT`, `BISHOP`, `ROOK`, `QUEEN`, `KING_MG`), tapered `KING_EG`, `evaluate()` with phase, pawn/rook terms.
+- `src/eval.rs`: tapered PSTs (`PAWN`/`KNIGHT`/`BISHOP`/`ROOK`/`QUEEN`/`KING_MG` + `_EG` mates, blended by phase) with `TEMPO` side-to-move term.
 - `src/search.rs`: `search_root()`, `negamax()`, `quiescence()`, `TT`, `order_moves()`.
 - `src/uci.rs`: `Engine`, command loop (`uci`, `position`, `go`, `stop`, `quit`, `perft`, `bench`, `d`, `eval`), `Limits`, `Limits.think_time_ms`.
 - `src/main.rs`: CLI dispatcher (`perft`, `bench`, `search`) and UCI entry (`uci::run()`).

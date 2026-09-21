@@ -13,7 +13,7 @@ This file explains how the engine evaluates positions and searches. It complemen
 - `side: Color` (`White`/`Black`), `castling: u8` (bits `WK=1`, `WQ=2`, `BK=4`, `BQ=8`), `ep: Option<u8>`.
 - `hash: u64` (Zobrist), `hash_history: Vec<u64>` (includes initial + after each `make`, including null moves).
 - Zobrist uses deterministic `splitmix64` (seed `0x243F6A8885A308D3`) with per-piece/per-square/per-castling/per-EP-file keys.
-- Undo (`Undo`) stores previous `move`, `captured`, `captured_sq`, `castling`, `ep`, `half`, `hash`.
+- Undo (`Undo`) stores previous `move`, `captured`, `captured_sq`, `castling`, `ep`, `half`, `hash`. Captures are cleared/restored by recorded owner (`cap.color`), never assumed enemy — this keeps make/unmake symmetric even for hand-fed phantom moves.
 
 ---
 
@@ -37,16 +37,20 @@ No special flag bits. Castling is inferred in `make_move`: if a `King` moves 2 f
 
 `phase = weight(Pawn=0, Knight/Bishop=1, Rook=2, Queen=4, King=0)`, clamped to `[0, 24]`. At `phase = 24` the position is full-material (all 4 knights, 4 bishops, 4 rooks, 2 queens active); at `phase = 0` only kings remain.
 
-The phase drives the `King` PST interpolation, the pawn-shield term (`shield_diff * phase / 24`, full middlegame → 0 endgame) and the passer king-distance term (`(24 - phase)` scaling, full endgame → 0 middlegame); other terms (`PAWN`, `KNIGHT`, etc.) use fixed middlegame tables.
+The phase drives every piece-table interpolation (`PAWN`/`KNIGHT`/`BISHOP`/
+`ROOK`/`QUEEN`/`KING_MG` blended with their `_EG` mates), the pawn-shield term
+(`shield_diff * phase / 24`, full middlegame → 0 endgame) and the passer
+king-distance term (`(24 - phase)` scaling, full endgame → 0 middlegame).
 
 ### 3.2 Mobility / shield / passer distance
 
 - Mobility (`MOB_KNIGHT/BISHOP/ROOK = 2`, `MOB_QUEEN = 1` cp per pseudo-legal destination, via `movegen::mobility_count`; pawns/kings excluded, owner-perspective signed). Symmetric; startpos contributes 0.
 - Pawn shield (`king_shield`: +8 per own pawn one rank ahead of a home king on the 3 neighboring files, +4 two ranks ahead; kings tracked in `evaluate`'s first pass, no extra scans). Wired `(w - b) * phase / 24`.
 - Passer king distance (inside `pawn_structure` for passers only): `(d_enemy - d_own) * 6 * (24 - phase) / 24` with Chebyshev distances to the promotion square; skipped when a king is missing. Quantifies the "square" rule.
-- `development_bonus` is owner-signed (a developed Black piece scores for Black); `eval_is_color_symmetric` pins exact negation on a color-flipped mirror.
+- `development_bonus` is owner-signed (a developed Black piece scores for Black); `eval_is_color_symmetric` pins exact negation on a color-flipped mirror (with side to move mirrored too, since tempo follows the mover).
+- Tempo (`TEMPO = 12`): White-perspective side-to-move bonus applied in `evaluate` (not `side_eval`), so the `eval` command shows it and `side_eval` always credits the mover. Symmetric positions differ only by this term; startpos evaluates to exactly `TEMPO`.
 
-### 3.3 Tapered King (`KING_MG` / `KING_EG`)
+### 3.3 Tapered tables (all pieces)
 
 ```rust
 fn king_pst(sq, color, phase) -> i32 {
@@ -59,6 +63,7 @@ fn king_pst(sq, color, phase) -> i32 {
 - `KING_MG`: central squares (`e5`, `d5`, etc.) are best; corners worst (`-50`).
 - `KING_EG`: very central (`d4`, `e4`, `d5`, `e5`) best (`+40`); edges/corners negative (`-50`).
 - At `phase = 24` the king behaves like the middlegame table; at `phase = 0` it pulls toward the center (endgame activity).
+- Pawns/knights/bishops/rooks/queens use the same blend with their own endgame tables (`PAWN_EG` rewards advanced central pawns, `ROOK_EG`/`QUEEN_EG` mild centralization, `BISHOP_EG` central diagonals, `KNIGHT_EG` center pull) via `pawn_pst` / `knight_pst` / `bishop_pst` / `rook_pst` / `queen_pst`.
 
 ---
 
@@ -104,7 +109,7 @@ fn king_pst(sq, color, phase) -> i32 {
 - Move generation order: hash move (10M) > promotion (900k + victim*10) > captures (MVV-LVA: `1_000_000 + victim*10 - attacker`) > EP (`1_000_000 + pawn - pawn`) > killers (`800_000` / `790_000`) > countermove (`785_000`, quiet reply to the previous move via `counter[prev.from][prev.to]`, tracked on a per-ply move `stack`) > history score.
 - Killer moves: `killers[ply]` array (`[Option<Move>; 2]`). Only quiet moves (`!cap`, `!ep`, `!promo`) update killers/history/countermove.
 - Internal iterative reduction: `depth -= 1` at `depth >= 6` with no hash move (all node types; seeds the TT for ordering).
-- History aging: `*h = (*h + depth*depth).min(1_000_000)`.
+- History aging: `*h = (*h + depth*depth).min(1_000_000)` on cutoff; quiet fail-lows take symmetric gravity (`*h = (*h - depth*depth).max(-1_000_000)`, root + negamax) so stale history can't outrank newly-good moves. Measured: bench8 −4.9% nodes at fixed depth 8.
 - `note_cutoff()` updates killers/history for quiet moves; `ply < MAX_PLY` guard prevents overflow.
 - `quiescence()`: `in_check` → all legal moves; else captures + promotions only (`generate_captures()`). Delta pruning skips captures when `victim + stand + 150 <= alpha` (promotions never skipped). `alpha` updated with `stand`; return `alpha` (not `stand`) when no captures improve it.
 - `quiescence` capped at `MAX_PLY + 24`; `ply >= MAX_PLY + 24` returns `side_eval()`.
@@ -116,6 +121,10 @@ fn king_pst(sq, color, phase) -> i32 {
 
 - `generate_pseudo()` walks the bitboards type-major (P/K via lookup
   tables, sliders via ray attacks), pushing to `Vec<Move>` (capacity `64`).
+  Pawn EP captures additionally require an enemy pawn on the jumped square
+  (`ep_capture_ok`): stale EP squares in FENs emit nothing, so no phantom
+  move can poison make/unmake (regression test
+  `stale_ep_square_emits_no_phantom_capture`).
 - `generate_pseudo_captures()` emits captures/EP/all promotions only (no quiets, no castling); `generate_captures()` legality-checks just that set. (Also fixed an old-filter bug: quiet non-pawn moves landing on the EP square were misclassified as captures.)
 - `generate_legal()` filters pseudo-moves by `make_move` + `!in_check(side)` + `unmake_move`.
 - `mobility_count()` (+ `count_stepper`/`count_slider`) mirrors the generators allocation-free for eval.

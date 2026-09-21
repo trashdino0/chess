@@ -34,8 +34,16 @@ thread + poll callback in `uci.rs`.
 - `Move` is `{from, to, promotion}` only. Castling / EP / double-push are inferred
   from board state inside `make_move` — never add flags to `Move`.
 - `evaluate()` is White-perspective; `side_eval()` converts for negamax. PSTs are
-  stored rank8-first and read owner-perspective (`pst_own`), signed once by color.
-  Negating black's table value AND the total double-counts — this bug happened before.
+  stored rank8-first and read owner-perspective (tapered `pawn/knight/bishop/
+  rook/queen/king_pst` blend `(mg*phase + eg*(24-phase))/24`), signed once by
+  color. Negating black's table value AND the total double-counts — this bug
+  happened before. Symmetric positions differ only by the `TEMPO` side-to-move
+  term (startpos evaluates to exactly `TEMPO`, not 0).
+- EP captures require an enemy pawn on the jumped square (`ep_capture_ok` in
+  `movegen.rs`); stale EP squares in FENs must NOT emit captures (phantom EPs
+  once poisoned the board and lost 13 games on illegal king captures).
+  `make/unmake_move` clear/restore captures by recorded owner (`cap.color`),
+  never by assumed enemy.
 - Mate scores: `MATE = 100_000`, `MATE_BOUND` threshold; TT store adds `ply`,
   probe subtracts it. Root stores its result to TT each iteration (that's what
   feeds PV collection); stalemate/no-move at root returns `bestmove 0000`.
