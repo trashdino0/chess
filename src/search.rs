@@ -47,7 +47,11 @@ impl Limits {
     /// Milliseconds to think, or None for untimed (depth/infinite).
     pub fn think_time_ms(&self, side: Color) -> Option<u64> {
         if let Some(mt) = self.movetime {
-            return Some(mt.saturating_sub(30).max(10));
+            // Scale-aware safety margin: a flat 30ms dominates bullet
+            // budgets, while a loaded machine needs more than 30ms of
+            // headroom at long controls. 10% bounded to [30, 200].
+            let margin = (mt / 10).clamp(30, 200);
+            return Some(mt.saturating_sub(margin).max(10));
         }
         let (own, inc) = match side {
             Color::White => (self.wtime?, self.winc.unwrap_or(0)),
@@ -58,8 +62,12 @@ impl Limits {
             _ => own / 20,
         };
         let mut t = base + inc / 2;
-        if own > 200 {
-            t = t.min(own - 100);
+        // Scale-aware clock reserve: 10% of remaining time, bounded to
+        // [100ms, 1s], so latency spikes under load can't forfeit on a
+        // nearly-empty clock while costing <2% with plenty of time left.
+        let reserve = (own / 10).clamp(100, 1000);
+        if own > reserve {
+            t = t.min(own - reserve);
         }
         Some(t.clamp(10, 60_000 * 30))
     }
@@ -466,8 +474,21 @@ impl Searcher {
         let mut best = root_moves[0];
         let mut score = side_eval(board);
         let max_d = self.max_depth.min(MAX_PLY as u8);
+        // Total budget for the soft deadline below (None = untimed depth
+        // search, which always runs to completion).
+        let budget = self.deadline.map(|dl| dl.saturating_duration_since(start));
 
         for depth in self.start_depth.max(1)..=max_d {
+            // Soft deadline: don't start an iteration once 65% of the
+            // budget is spent. A depth that can't finish contributes
+            // nothing (its abort is discarded), while the poll loop it
+            // burns still costs wall-clock near the flag. First iteration
+            // always runs so there is always a searched best move.
+            if depth > self.start_depth.max(1)
+                && budget.is_some_and(|b| start.elapsed() * 100 > b * 65)
+            {
+                break;
+            }
             let prev = score;
             // Aspiration windows from depth 4 on (skipped after a mate score:
             // mate scores + narrow windows only waste re-searches).
@@ -1272,5 +1293,67 @@ mod tests {
             assert!(crate::movegen::generate_legal(&mut board).contains(&mv));
             assert_eq!(board.to_fen(), fen0, "aborted search mutated the board");
         }
+    }
+
+    #[test]
+    fn think_time_budgets() {
+        // P1: pin the time math so future tuning can't silently break it.
+        // Movetime uses a scale-aware margin (10% bounded to [30, 200]).
+        let mt = |ms| Limits {
+            movetime: Some(ms),
+            ..Default::default()
+        };
+        assert_eq!(mt(150).think_time_ms(Color::White), Some(120));
+        assert_eq!(mt(1000).think_time_ms(Color::White), Some(900));
+        assert_eq!(mt(30).think_time_ms(Color::White), Some(10)); // floor
+                                                                  // Clocks: own/20 + inc/2 with a scale-aware reserve.
+        let clk = |w: u64, b: u64, wi: u64, bi: u64| Limits {
+            wtime: Some(w),
+            btime: Some(b),
+            winc: Some(wi),
+            binc: Some(bi),
+            ..Default::default()
+        };
+        assert_eq!(
+            clk(60000, 60000, 0, 0).think_time_ms(Color::White),
+            Some(3000)
+        );
+        assert_eq!(
+            clk(60000, 60000, 2000, 2000).think_time_ms(Color::Black),
+            Some(4000)
+        );
+        // movestogo divisor.
+        let mtg = Limits {
+            wtime: Some(60000),
+            movestogo: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(mtg.think_time_ms(Color::White), Some(6000));
+        // No clock at all: untimed.
+        assert_eq!(Limits::default().think_time_ms(Color::White), None);
+        // Nearly-flagged clock still yields something playable.
+        assert_eq!(clk(150, 150, 0, 0).think_time_ms(Color::White), Some(10));
+    }
+
+    #[test]
+    fn tiny_movetime_returns_promptly() {
+        // Soft/hard deadline machinery must answer fast and legally on a
+        // near-zero budget, never hang past it by a wide margin.
+        let tt = TT::new(1);
+        let lim = Limits {
+            movetime: Some(5),
+            ..Default::default()
+        };
+        let mut board =
+            crate::board::Board::from_fen(crate::board::STARTPOS_FEN).expect("valid startpos");
+        let t = std::time::Instant::now();
+        let res = search_root(&mut board, &tt, &lim, 1, &mut || false);
+        let mv = res.best.expect("fallback move");
+        assert!(crate::movegen::generate_legal(&mut board).contains(&mv));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "5ms search took {:?}",
+            t.elapsed()
+        );
     }
 }
