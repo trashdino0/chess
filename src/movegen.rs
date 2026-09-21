@@ -109,11 +109,32 @@ fn gen_pawn(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) {
         let to = make_sq(nf as u8, nr as u8);
         if board.occ[ei] & bit(to) != 0 {
             push_pawn_move(moves, sq, to, nr == promo_rank_next);
-        } else if Some(to) == board.ep {
+        } else if ep_capture_ok(board, to, side) {
             // EP capture is never a promotion (5th rank).
             moves.push(Move::new(sq, to, None));
         }
     }
+}
+
+/// En-passant capture legality pre-check: `to` must be the EP square AND an
+/// enemy pawn must stand on the square the double push jumped over.
+/// Without the victim check, stale EP squares in FENs emit phantom captures
+/// (e.g. Black c7xd6/e7xd6 with no white pawn on d5); their make/unmake
+/// then corrupts the board (the "captured" own pawn is restored to the
+/// wrong color), poisoning search and emitting illegal king-capture moves.
+fn ep_capture_ok(board: &Board, to: u8, side: Color) -> bool {
+    if Some(to) != board.ep {
+        return false;
+    }
+    let behind = match side {
+        Color::White => to.checked_sub(8),
+        Color::Black => to.checked_add(8),
+    };
+    behind.map_or(false, |sq| {
+        board
+            .piece_at(sq)
+            .is_some_and(|p| p.color == side.opposite() && p.pt == PieceType::Pawn)
+    })
 }
 
 /// Pseudo-legal captures/promotions only (for quiescence): captures,
@@ -183,7 +204,7 @@ fn gen_pawn_captures(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) 
         let to = make_sq(nf as u8, nr as u8);
         if board.occ[ei] & bit(to) != 0 {
             push_pawn_move(moves, sq, to, nr == promo_rank_next);
-        } else if Some(to) == board.ep {
+        } else if ep_capture_ok(board, to, side) {
             moves.push(Move::new(sq, to, None));
         }
     }

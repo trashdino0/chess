@@ -433,7 +433,6 @@ impl Board {
 
         let side = self.side;
         let si = side.idx();
-        let ei = side.opposite().idx();
         let mover = self.piece_at(mv.from).expect("make_move: no piece");
         debug_assert_eq!(mover.color, side);
 
@@ -460,7 +459,10 @@ impl Board {
         // Move the piece bits (handle promotion).
         self.pieces[si][mover.pt.idx()] &= !bit(mv.from);
         if let Some(cap) = undo.captured {
-            self.pieces[ei][cap.pt.idx()] &= !bit(captured_sq);
+            // Clear by recorded owner, not assumed enemy: for every
+            // generated capture this IS the enemy, and a phantom EP passed
+            // in by hand stays make/unmake symmetric instead of corrupting.
+            self.pieces[cap.color.idx()][cap.pt.idx()] &= !bit(captured_sq);
         }
         let placed_pt = mv.promotion.unwrap_or(mover.pt);
         self.pieces[si][placed_pt.idx()] |= bit(mv.to);
@@ -564,10 +566,11 @@ impl Board {
         // (EP goes on its own square).
         {
             let si = self.side.idx();
-            let ei = self.side.opposite().idx();
             self.pieces[si][mover.pt.idx()] &= !bit(mv.to);
             if let Some(cap) = undo.captured {
-                self.pieces[ei][cap.pt.idx()] |= bit(undo.captured_sq);
+                // Restore by recorded owner (see make_move): symmetric even
+                // for a phantom EP handed in directly.
+                self.pieces[cap.color.idx()][cap.pt.idx()] |= bit(undo.captured_sq);
             }
             let orig_pt = if mv.promotion.is_some() {
                 PieceType::Pawn
@@ -788,6 +791,56 @@ mod tests {
         assert_eq!(p.to_fen(), pfen);
         assert_eq!(p.hash_history.len(), 1);
         assert_eq!(p.hash_counts.len(), 1);
+    }
+
+    #[test]
+    fn stale_ep_square_emits_no_phantom_capture() {
+        // Match regression (13 illegal `d7e8q` losses): a FEN with a stale
+        // EP square (d6 set, no white pawn on d5) emitted phantom Black EP
+        // captures (c7xd6/e7xd6); their make/unmake restored the "captured"
+        // own pawn to the wrong color (+d7 white pawn), poisoning the board
+        // until search played a king capture. Generation must emit nothing
+        // targeting a victimless EP square, and filtering must not mutate.
+        use crate::movegen::{generate_legal, generate_pseudo};
+        let mut b =
+            Board::from_fen("r1bqkbnr/pppp1ppp/2n5/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R b KQkq d6 0 1")
+                .unwrap();
+        let fen0 = b.to_fen();
+        // The phantom EP captures (c7/e7xd6 with no white pawn on d5) are
+        // gone, while the ordinary quiet push d7d6 is still generated.
+        let phantom1 = Move::from_uci("c7d6").unwrap();
+        let phantom2 = Move::from_uci("e7d6").unwrap();
+        let quiet_push = Move::from_uci("d7d6").unwrap();
+        assert!(!generate_pseudo(&mut b).contains(&phantom1));
+        assert!(!generate_pseudo(&mut b).contains(&phantom2));
+        assert!(generate_pseudo(&mut b).contains(&quiet_push));
+        assert!(!generate_legal(&mut b).contains(&phantom1));
+        assert!(!generate_legal(&mut b).contains(&phantom2));
+        assert_eq!(b.to_fen(), fen0, "legality filtering mutated the board");
+        // The full match scenario: e5xd4 applies with no phantom pawn.
+        let u = play(&mut b, "e5d4");
+        assert_eq!(
+            b.to_fen(),
+            "r1bqkbnr/pppp1ppp/2n5/8/3pP3/5N2/PPP2PPP/RNBQKB1R w KQkq - 0 2"
+        );
+        b.unmake_move(u);
+        assert_eq!(b.to_fen(), fen0);
+        // A hand-fed phantom EP (c7->d6 while ep=d6) round-trips exactly:
+        // the own-pawn "victim" is restored to its recorded owner.
+        let u = play(&mut b, "c7d6");
+        b.unmake_move(u);
+        assert_eq!(b.to_fen(), fen0);
+        b.check_occ();
+        // A real EP capture still generates and round-trips (d5 victim
+        // present): e5xd6 removes the d5 pawn.
+        let mut e = Board::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").unwrap();
+        let ep_mv = Move::from_uci("e5d6").unwrap();
+        assert!(generate_pseudo(&mut e).contains(&ep_mv));
+        let efen = e.to_fen();
+        let u = play(&mut e, "e5d6");
+        assert_eq!(e.to_fen(), "4k3/8/3P4/8/8/8/8/4K3 b - - 0 1");
+        e.unmake_move(u);
+        assert_eq!(e.to_fen(), efen);
     }
 
     #[test]
