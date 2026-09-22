@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::bitboard::bit;
 use crate::board::Board;
 use crate::eval::evaluate;
-use crate::movegen::{generate_captures, generate_legal, generate_pseudo};
+use crate::movegen::{generate_captures, generate_legal, generate_pseudo, see};
 use crate::types::*;
 
 pub const MATE: i32 = 100_000;
@@ -944,6 +944,13 @@ impl Searcher {
             if ply < self.stack.len() {
                 self.stack[ply] = Some(mv);
             }
+            // Delta pruning: even winning the full exchange can't recover
+            // alpha (SEE + static, not victim + static — a hanging QxP is
+            // skipped, a PxQ sac is searched). Promotions and evasions never
+            // skip. All scores here are side-relative, matching alpha.
+            if !in_check && mv.promotion.is_none() && see(board, mv) + stand + 150 <= alpha {
+                continue;
+            }
             let undo = board.make_move(mv);
             let res = self.quiescence(board, -beta, -alpha, ply + 1, poll);
             board.unmake_move(undo);
@@ -1120,13 +1127,22 @@ fn order_moves(
                     // promotion capture: victim value on top
                     s += victim.pt.value() * 10;
                 }
-            } else if let Some(victim) = board.piece_at(mv.to) {
-                let attacker = board.piece_at(mv.from).map(|p| p.pt.value()).unwrap_or(0);
-                // MVV-LVA: most valuable victim, least valuable attacker.
-                s = 1_000_000 + victim.pt.value() * 10 - attacker;
-            } else if Some(mv.to) == board.ep {
-                // En passant: capture a pawn with a pawn.
-                s = 1_000_000 + PieceType::Pawn.value() * 10 - PieceType::Pawn.value();
+            } else if board.piece_at(mv.to).is_some() || Some(mv.to) == board.ep {
+                // Captures (and EP): SEE decides the tier. Winning captures
+                // keep MVV-LVA among equals; losing captures drop below
+                // killers/counter, ordered by badness — QxP into a pawn is
+                // searched last, not first.
+                let exchange = see(board, mv);
+                if exchange >= 0 {
+                    let victim = board
+                        .piece_at(mv.to)
+                        .map(|p| p.pt.value())
+                        .unwrap_or(PieceType::Pawn.value());
+                    let attacker = board.piece_at(mv.from).map(|p| p.pt.value()).unwrap_or(0);
+                    s = 1_000_000 + victim * 10 - attacker;
+                } else {
+                    s = 700_000 + exchange;
+                }
             } else {
                 // Quiet: killers, then countermove, then history.
                 if ply < killers.len() {
@@ -1322,6 +1338,47 @@ mod tests {
                 assert_eq!(e.depth, 6);
             }
         }
+    }
+
+    #[test]
+    fn see_losing_capture_sorts_below_killer() {
+        // P3: Qa4xb5 into a6 (−800) must sort below a killer quiet, while a
+        // winning capture keeps its MVV-LVA tier above killers.
+        let mut board = Board::from_fen("4k3/8/p7/1p6/Q7/8/8/4K3 w - - 0 1").unwrap();
+        let capture = crate::movegen::generate_legal(&mut board)
+            .into_iter()
+            .find(|m| m.from == 24 && m.to == 33)
+            .expect("Qxb5 must be legal");
+        let killer = Move::new(4, 5, None); // Ke1f1, legal and quiet
+        assert!(crate::movegen::generate_legal(&mut board).contains(&killer));
+        let mut killers = [[None; 2]; MAX_PLY + 8];
+        killers[0][0] = Some(killer);
+        let history = [[[0i32; 64]; 64]; 2];
+        let counter = [[None; 64]; 64];
+        let mut moves = vec![capture, killer];
+        order_moves(
+            &mut board, &mut moves, None, None, 0, &killers, &history, &counter,
+        );
+        assert_eq!(moves[0], killer, "losing capture must sort below killer");
+
+        // Same board without the a6 defender: Qxb5 wins (+100) and outranks.
+        let mut board2 = Board::from_fen("4k3/8/8/1p6/Q7/8/8/4K3 w - - 0 1").unwrap();
+        let capture2 = crate::movegen::generate_legal(&mut board2)
+            .into_iter()
+            .find(|m| m.from == 24 && m.to == 33)
+            .expect("Qxb5 must be legal");
+        let mut moves2 = vec![killer, capture2];
+        order_moves(
+            &mut board2,
+            &mut moves2,
+            None,
+            None,
+            0,
+            &killers,
+            &history,
+            &counter,
+        );
+        assert_eq!(moves2[0], capture2, "winning capture must sort first");
     }
 
     #[test]

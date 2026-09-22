@@ -6,7 +6,8 @@
 //! differently (reported per sub-step, judged by the self-play gate).
 
 use crate::bitboard::{
-    bishop_attacks, bit, king_attacks, knight_attacks, pop_lsb, queen_attacks, rook_attacks,
+    bishop_attacks, bit, king_attacks, knight_attacks, pawn_attackers, pop_lsb, queen_attacks,
+    rook_attacks,
 };
 use crate::board::Board;
 use crate::types::*;
@@ -324,6 +325,146 @@ pub fn generate_captures(board: &mut Board) -> Vec<Move> {
     legal
 }
 
+// ---------------------------------------------------------------------------
+// Static exchange evaluation (SEE)
+// ---------------------------------------------------------------------------
+
+/// Attacker commitment order for SEE: least valuable first (king last).
+const SEE_ORDER: [PieceType; 6] = [
+    PieceType::Pawn,
+    PieceType::Knight,
+    PieceType::Bishop,
+    PieceType::Rook,
+    PieceType::Queen,
+    PieceType::King,
+];
+
+/// Attackers of color `by` on `sq` restricted to one piece type, given an
+/// occupancy and a placement snapshot (queens attack as bishop+rook but live
+/// only in the queen bucket).
+fn attackers_of(sq: u8, by: Color, pt: PieceType, bb: &[[u64; 6]; 2], occ: u64) -> u64 {
+    let p = bb[by.idx()][pt.idx()];
+    match pt {
+        PieceType::Pawn => pawn_attackers(sq, by) & p,
+        PieceType::Knight => knight_attacks(sq) & p,
+        PieceType::Bishop => bishop_attacks(sq, occ) & p,
+        PieceType::Rook => rook_attacks(sq, occ) & p,
+        PieceType::Queen => queen_attacks(sq, occ) & p,
+        PieceType::King => king_attacks(sq) & p,
+    }
+}
+
+/// Static exchange evaluation: net material in centipawns from the
+/// side-to-move's perspective if `mv` is played and both sides recapture
+/// with least-valuable attackers. X-ray aware (sliders behind the exchange
+/// join once uncovered); either side stops capturing when stopping scores
+/// better, so a defended `QxP` is −800, not +100. Scores captures, EP, and
+/// promotions (quiet promotions earn the promotion delta); other quiets
+/// return 0. Pins are ignored (standard). Assumes `mv` is legal.
+pub fn see(board: &Board, mv: Move) -> i32 {
+    let stm = board.side;
+    let from = mv.from;
+    let to = mv.to;
+    let mover = match board.piece_at(from) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let target = board.piece_at(to);
+    let is_ep = mover.pt == PieceType::Pawn && target.is_none() && Some(to) == board.ep;
+    // Victim value. EP targets an empty square: the victim is the jumped pawn.
+    let victim_val = match target {
+        Some(p) => p.pt.value(),
+        None => {
+            if is_ep {
+                PieceType::Pawn.value()
+            } else {
+                // Quiet: only a promotion changes material.
+                return match mv.promotion {
+                    Some(pt) => pt.value() - PieceType::Pawn.value(),
+                    None => 0,
+                };
+            }
+        }
+    };
+    let promo_delta = match mv.promotion {
+        Some(pt) => pt.value() - PieceType::Pawn.value(),
+        None => 0,
+    };
+
+    // Placement snapshot with the capture applied: mover lands on `to`
+    // (promoted if promoting), victim gone, EP clears the jumped pawn too.
+    let mut bb = board.pieces;
+    let mut occ = board.occ_all;
+    bb[stm.idx()][mover.pt.idx()] &= !bit(from);
+    occ ^= bit(from);
+    if is_ep {
+        let behind = if stm == Color::White { to - 8 } else { to + 8 };
+        for t in 0..6 {
+            bb[stm.opposite().idx()][t] &= !bit(behind);
+        }
+        occ ^= bit(behind);
+    } else if let Some(v) = target {
+        bb[v.color.idx()][v.pt.idx()] &= !bit(to);
+    }
+    let mut on_to = match mv.promotion {
+        Some(pt) => pt,
+        None => mover.pt,
+    };
+    bb[stm.idx()][on_to.idx()] |= bit(to);
+    // `to` stays occupied throughout; only origins vacate.
+
+    // Swap list: nets[i] = cumulative material for stm after i+1 captures.
+    let mut nets = [0i32; 32];
+    nets[0] = victim_val + promo_delta;
+    let mut n = 1usize;
+    let mut side = stm.opposite();
+    loop {
+        let mut next = None;
+        for &pt in &SEE_ORDER {
+            let set = attackers_of(to, side, pt, &bb, occ);
+            if set != 0 {
+                next = Some((set.trailing_zeros() as u8, pt));
+                break;
+            }
+        }
+        let (sq, pt) = match next {
+            Some(x) => x,
+            None => break,
+        };
+        // Attacker takes: previous occupant removed, attacker lands on `to`.
+        // Net update from stm's view: losing the occupant hurts when the
+        // opponent captures, winning it helps when we recapture.
+        bb[side.opposite().idx()][on_to.idx()] &= !bit(to);
+        bb[side.idx()][pt.idx()] &= !bit(sq);
+        bb[side.idx()][pt.idx()] |= bit(to);
+        occ ^= bit(sq);
+        if n == 32 {
+            break;
+        }
+        if side == stm {
+            nets[n] = nets[n - 1] + on_to.value();
+        } else {
+            nets[n] = nets[n - 1] - on_to.value();
+        }
+        on_to = pt;
+        n += 1;
+        side = side.opposite();
+    }
+    // Minimax over stopping points: after i+1 captures the opponent moves
+    // when i is even (minimize) and we move when i is odd (maximize).
+    let mut best = nets[n - 1];
+    let mut i = n - 1;
+    while i > 0 {
+        i -= 1;
+        if i % 2 == 0 {
+            best = nets[i].min(best);
+        } else {
+            best = nets[i].max(best);
+        }
+    }
+    best
+}
+
 /// Move count test. `board` is restored afterwards.
 pub fn perft(board: &mut Board, depth: u32) -> u64 {
     if depth == 0 {
@@ -509,5 +650,78 @@ mod tests {
                 b.unmake_move(undo);
             }
         }
+    }
+
+    fn see_move(fen: &str, from: u8, to: u8) -> i32 {
+        let mut b = Board::from_fen(fen).unwrap();
+        let mv = generate_legal(&mut b)
+            .into_iter()
+            .find(|m| m.from == from && m.to == to && m.promotion.is_none())
+            .expect("test move must be legal");
+        see(&b, mv)
+    }
+
+    #[test]
+    fn see_hanging_pawn() {
+        // Qa4xb5 hanging: +100.
+        assert_eq!(see_move("4k3/8/8/1p6/Q7/8/8/4K3 w - - 0 1", 24, 33), 100);
+    }
+
+    #[test]
+    fn see_defended_pawn_loses_queen() {
+        // Qa4xb5 defended by a6: +100 − 900 = −800.
+        assert_eq!(see_move("4k3/8/p7/1p6/Q7/8/8/4K3 w - - 0 1", 24, 33), -800);
+    }
+
+    #[test]
+    fn see_pawn_takes_queen() {
+        // e4xd5 undefended: +900.
+        assert_eq!(see_move("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1", 28, 35), 900);
+    }
+
+    #[test]
+    fn see_even_exchange() {
+        // Ne3xd5, e6 recaptures: +320 − 320 = 0.
+        assert_eq!(see_move("4k3/8/4p3/3n4/8/4N3/8/4K3 w - - 0 1", 20, 35), 0);
+    }
+
+    #[test]
+    fn see_xray_behind_rook() {
+        // Rd2xd5 grabbing a knight defended by Bc6. With Qd1 backing (an
+        // X-ray the rook uncovers): +320 − 500 + 330 = +150 — Black's
+        // recapture hangs the bishop, so the exchange wins. Without the
+        // queen it is just a lost rook: +320 − 500 = −180.
+        assert_eq!(
+            see_move("4k3/8/2b5/3n4/8/8/3R4/3QK3 w - - 0 1", 11, 35),
+            150
+        );
+        assert_eq!(
+            see_move("4k3/8/2b5/3n4/8/8/3R4/4K3 w - - 0 1", 11, 35),
+            -180
+        );
+    }
+
+    #[test]
+    fn see_en_passant() {
+        // d5xe6 e.p., e6 undefended: +100.
+        assert_eq!(see_move("4k3/8/8/3Pp3/8/8/8/4K3 w - e6 0 1", 35, 44), 100);
+    }
+
+    #[test]
+    fn see_promotions() {
+        // Quiet queen promotion: +800 material delta.
+        let mut b = Board::from_fen("4k3/1P6/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let promo = generate_legal(&mut b)
+            .into_iter()
+            .find(|m| m.from == 49 && m.to == 57 && m.promotion == Some(PieceType::Queen))
+            .expect("promo must be legal");
+        assert_eq!(see(&b, promo), 800);
+        // bxc8=Q grabbing a knight with no defenders: +320 + 800.
+        let mut b = Board::from_fen("2n1k3/1P6/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let cap = generate_legal(&mut b)
+            .into_iter()
+            .find(|m| m.from == 49 && m.to == 58 && m.promotion == Some(PieceType::Queen))
+            .expect("capture promo must be legal");
+        assert_eq!(see(&b, cap), 1120);
     }
 }

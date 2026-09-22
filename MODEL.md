@@ -12,7 +12,7 @@ contributor rules in `AGENTS.md`; roadmap in `plan.md` (local-only).
 |---|---|
 | `types.rs` | `Color`, `PieceType`, `Move{from,to,promotion}`, square helpers (`0=a1`) |
 | `board.rs` | `pieces[[u64;6];2]` + `occ[2]` + `occ_all`, FEN, Zobrist, `make/unmake_move/null`, `Undo`, draw state |
-| `movegen.rs` | `generate_pseudo/legal/captures`, `mobility_count`, `perft`, `ep_capture_ok` |
+| `movegen.rs` | `generate_pseudo/legal/captures`, `mobility_count`, `perft`, `ep_capture_ok`, `see` |
 | `eval.rs` | `evaluate()` (White view), tapered PSTs, structure/mobility/shield, `TEMPO` |
 | `search.rs` | `search_root`, `negamax`, `quiescence`, lock-free `TT`, Lazy SMP, `Limits` |
 | `uci.rs` | `Engine`, command loop, `parse_go`, `apply_position`, `BENCH_FENS` |
@@ -30,10 +30,10 @@ contributor rules in `AGENTS.md`; roadmap in `plan.md` (local-only).
 | Futility margins | 120 (d1) / 250 (d2) | Frontier drop to quiescence |
 | LMP | depth ≤ 2, skip quiet i ≥ 6+depth·6 | Non-killers near leaves |
 | LMR | depth ≥ 3, late quiets −1 (−2 if depth ≥ 6, i ≥ 8) | Re-search on alpha exceed |
-| QSearch delta margin | 150 | Captures skipped if victim+static+150 ≤ alpha |
+| QSearch delta margin | 150 | Captures skipped if SEE+static+150 ≤ alpha (promos never) |
 | History | ±depth², clamp ±1,000,000 | Bonus on cutoff, gravity malus on quiet fail-low |
-| Ordering scores | hash 10M, promo 900k+victim·10, MVV-LVA 1M+victim·10−attacker, killers 800k/790k, counter 785k | |
-| Time | `movetime−30` (floor 10); clocks `own/min(movestogo,50)` (default ÷20) `+ inc/2` | Bare `go` = depth 6 |
+| Ordering scores | hash 10M, promo 900k+victim·10, SEE≥0 captures MVV-LVA 1M+victim·10−attacker, killers 800k/790k, counter 785k, losing captures 700k+SEE | |
+| Time | `movetime−(mt/10∈[30,200])`; clocks `own/min(movestogo,50)+inc/2` minus reserve `(own/10∈[100,1000])`; soft deadline 65% | Bare `go` = depth 6 |
 
 ## TT entry (63 packed bits + atomics)
 
@@ -50,18 +50,19 @@ Mate scores ply-adjusted (store +, probe −); root stores every iteration
 
 | Check | Expected |
 |---|---|
-| `cargo test` | 38 passed |
+| `cargo test` | 46 passed |
 | `perft 4` startpos | 197281 (~25ms release) |
 | Kiwipete d3 / pos3 / endgame | 97862 / exact / exact (see tests) |
-| `bench 8` | 2,909,536 nodes, ~700–835k nps (±8% run noise) |
-| Gates | tapered kept; gravity 32–19–9 (+76 ±92); 200-game attempt exposed EP bug |
+| `bench 8` | 784,554 nodes, ~590–620k nps (±8% run noise) |
+| Gates | tapered kept; gravity 32–19–9 (+76 ±92); 200-game attempt exposed EP bug; TT aging neutral (52–48); SEE kept (23–21–16 @40/10, depth-12 Ba6>dxe6 proof) |
 
-## Test inventory (38)
+## Test inventory (46)
 
 perft: startpos d1–4, Kiwipete (+d4), pos3 deep, endgame, captures-vs-filter
 (+children) · eval: balance/symmetry (mirrored side), queen, passer
 (blocked/beats), isolated, rook-open, king-centralize, shield (unit +
 intact/cracked), passer-king-distance, in-square, mobility · TT: pack
 round-trip, probe/store/collision, generation-prefers-fresh, threaded smoke,
-SMP legality · board:
+SMP legality · SEE: hanging/defended/pawn-takes-queen/even-exchange/
+xray-pair/EP/promotions, losing-capture-sorts-below-killer · board:
 make/unmake round-trip (+promotion), repetition counts, stale-EP phantom.

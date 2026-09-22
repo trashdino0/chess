@@ -189,10 +189,12 @@ subtracts) so "mate in 5" means the same thing at every depth. Startup size
 is the `Hash` option in MB (default 16).
 
 **Move ordering** (best first = more cutoffs = exponentially less work):
-hash move (10M) → promotions (900k + victim) → captures MVV-LVA
-(`1M + victim×10 − attacker`) → EP → killers (800k/790k) → countermove
-(785k: the reply that worked last time after the previous move) → history
-score. History gives `+depth²` (clamped +1M) to cutoff quiets and symmetric
+hash move (10M) → promotions (900k + victim) → winning captures by MVV-LVA
+(`1M + victim×10 − attacker`, SEE ≥ 0) → EP → killers (800k/790k) →
+countermove (785k: the reply that worked last time after the previous move)
+→ losing captures (`700k + SEE`, below counter) → history score. The SEE
+split demotes sacrifices like defended `QxP` (−800) to the back instead of
+fronting them on victim value. History gives `+depth²` (clamped +1M) to cutoff quiets and symmetric
 **gravity** `−depth²` (clamped −1M) to quiet fail-lows, in root and negamax —
 measured −4.9% bench nodes.
 
@@ -212,10 +214,19 @@ each one risks cutting something real):
 **Quiescence.** Instead of a raw eval at the horizon (which is blind to
 hanging pieces), search continues with captures and promotions only — plus
 full evasions when in check. **Delta pruning** skips captures that can't
-recover alpha (`victim + static + 150 ≤ alpha`; promotions never skipped).
-Depth-capped at `MAX_PLY + 24`, then static eval. Draws (fifty-move,
+recover alpha even winning the full exchange (`SEE + static + 150 ≤ alpha`;
+promotions never skipped, evasions exempt). Depth-capped at
+`MAX_PLY + 24`, then static eval. Draws (fifty-move,
 insufficient material, repetition) return 0 inside search but never touch
 perft.
+
+**Static exchange evaluation** (`see()` in `movegen.rs`): net material for
+the side to move if a capture is played and both sides recapture with
+least-valuable attackers. Placement snapshot + occupancy are updated per
+swap so X-rays join once uncovered (taking through to a backed piece
+scores the recapture); either side stops when stopping scores better
+(minimax over stopping points). Pins ignored (standard). Cost: ~23% nps;
+payoff: bench8 2.91M → 0.78M nodes and steadier scores with depth.
 
 **Lazy SMP (`Threads` option).** Helper threads join via `thread::scope`,
 each with an owned board clone, the shared TT handle, staggered
