@@ -178,10 +178,13 @@ moves → `bestmove 0000` (mate scores `-MATE` if in check, else stalemate 0).
 
 **Transposition table.** Power-of-two array of lock-free slots
 (`key`/`data`/`check` as atomics, `check = key ^ data ^ SALT` so torn
-cross-thread reads fail closed as misses). Each entry packs 47 bits:
+cross-thread reads fail closed as misses). Each entry packs 63 bits:
 16-bit movecode (`0` = none, else `1 + (from | to≪6 | promo≪12)`),
-21-bit score offset by 2²⁰, 8-bit depth, 2-bit flag. Replacement is
-depth-preferred. **Mate scores are adjusted by ply** (store adds, probe
+21-bit score offset by 2²⁰, 8-bit depth, 2-bit flag, 16-bit generation.
+Replacement is generation-aware: a fresh generation (bumped by
+`new_search()` at every `search_root`) supersedes stale same-key entries
+even when shallower; within one generation the deeper entry wins.
+**Mate scores are adjusted by ply** (store adds, probe
 subtracts) so "mate in 5" means the same thing at every depth. Startup size
 is the `Hash` option in MB (default 16).
 
@@ -280,6 +283,26 @@ no generation aging; no SEE yet; no opening book or tablebases in-engine
 (the lichess bridge can supply books externally); time margins are thin for
 bullet; `openings.epd` contains one synthetic illegal-ish French line with a
 stale EP square (kept deliberately as phantom-EP coverage).
+
+---
+
+## 8. Future direction: NNUE evaluation (researched, see `plan.md` P9)
+
+The hand-written eval in §3 is slated for a neural replacement that keeps
+the zero-dependency design: training runs **outside** the repo with bullet
+(the Rust NNUE trainer most top engines use); the engine gains only scalar
+quantized inference plus weights embedded via `include_bytes!` — no crates.
+The starting architecture is HalfKP[40960]→256x2→32→32→1 (~10M parameters,
+~20MB quantized): each feature is an (own-king-square, piece, square) tuple,
+and only the handful of features a move touches are re-added to running
+accumulators (2 for quiet moves, 3–4 for captures/castling) instead of
+recomputing the network from scratch — the same "update, don't recompute"
+idea as incremental Zobrist hashing. Training needs 100M+ quiet labeled
+positions (self-play at fixed nodes after random plies; our lichess PGNs
+seed variety but get relabeled by our own search). First-net expectation is
+roughly +80–150 Elo over the HCE. Hardest correctness risk is accumulator
+desync in make/unmake — same silent-corruption class as the phantom-EP bug,
+gated by exact incremental-vs-full-recompute tests.
 
 ---
 

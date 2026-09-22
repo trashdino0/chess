@@ -49,6 +49,13 @@ thread + poll callback in `uci.rs`.
   feeds PV collection); stalemate/no-move at root returns `bestmove 0000`.
 - Repetition/fifty-move/insufficient-material return 0 inside search but must never
   affect `perft` counts.
+- Classic chess only: no variants or spinoffs (Chess960, atomic, …) — rule of
+  thumb. Movegen assumes standard castling/EP; keep it that way.
+- NNUE (when P9 starts) stays std-only: bullet training + data live outside
+  the repo and are never committed; only quantized weights ride along via
+  `include_bytes!` — no crates for it. Accumulator updates belong in the
+  make/unmake paths with an exact full-recompute cross-check test (desync is
+  the same silent-corruption class as phantom-EP).
 
 ## Vendored dirs
 

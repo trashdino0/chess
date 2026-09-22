@@ -35,29 +35,33 @@ contributor rules in `AGENTS.md`; roadmap in `plan.md` (local-only).
 | Ordering scores | hash 10M, promo 900k+victim·10, MVV-LVA 1M+victim·10−attacker, killers 800k/790k, counter 785k | |
 | Time | `movetime−30` (floor 10); clocks `own/min(movestogo,50)` (default ÷20) `+ inc/2` | Bare `go` = depth 6 |
 
-## TT entry (47 packed bits + atomics)
+## TT entry (63 packed bits + atomics)
 
 `Slot { key, data, check: AtomicU64 }`, `check = key ^ data ^ SALT`
 (`0x9E3779B97F4A7C15`; torn reads fail closed). `data`: movecode 16b
-(`0`=none else `1+(from\|to≪6\|promo≪12)`, promo=`idx+1`) \| score+2²⁰ 21b \|
-depth 8b \| flag 2b. Depth-preferred replacement; mate scores ply-adjusted
-(store +, probe −); root stores every iteration (feeds PV).
+(`0`=none else `1+(from|to≪6|promo≪12)`, promo=`idx+1`) | score+2²⁰ 21b |
+depth 8b | flag 2b | generation 16b (bits 47–62; 0 = cleared). Fresh
+generation supersedes stale same-key entries, depth-preferred within one
+generation; `new_search()` bumps per `search_root`, `clear()` resets to 0.
+Mate scores ply-adjusted (store +, probe −); root stores every iteration
+(feeds PV).
 
 ## Reference numbers
 
 | Check | Expected |
 |---|---|
-| `cargo test` | 34 passed |
+| `cargo test` | 38 passed |
 | `perft 4` startpos | 197281 (~25ms release) |
 | Kiwipete d3 / pos3 / endgame | 97862 / exact / exact (see tests) |
 | `bench 8` | 2,909,536 nodes, ~700–835k nps (±8% run noise) |
 | Gates | tapered kept; gravity 32–19–9 (+76 ±92); 200-game attempt exposed EP bug |
 
-## Test inventory (34)
+## Test inventory (38)
 
 perft: startpos d1–4, Kiwipete (+d4), pos3 deep, endgame, captures-vs-filter
 (+children) · eval: balance/symmetry (mirrored side), queen, passer
 (blocked/beats), isolated, rook-open, king-centralize, shield (unit +
 intact/cracked), passer-king-distance, in-square, mobility · TT: pack
-round-trip, probe/store/collision, threaded smoke, SMP legality · board:
+round-trip, probe/store/collision, generation-prefers-fresh, threaded smoke,
+SMP legality · board:
 make/unmake round-trip (+promotion), repetition counts, stale-EP phantom.

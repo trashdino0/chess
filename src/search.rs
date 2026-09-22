@@ -2,7 +2,7 @@
 //! quiescence, transposition table, null-move pruning, LMR, check extensions,
 //! killer + history move ordering and MVV-LVA capture ordering.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -98,11 +98,12 @@ struct Slot {
     check: AtomicU64,
 }
 
-/// Pack best/score/depth/flag into 47 bits of `data`: bits 0–15 movecode
-/// (`0` = None, else `1 + (from | to<<6 | promo<<12)` with
+/// Pack best/score/depth/flag/generation into 63 bits of `data`: bits 0–15
+/// movecode (`0` = None, else `1 + (from | to<<6 | promo<<12)` with
 /// `promo = PieceType::idx()+1`, 0 = none), bits 16–36 `(score + 2^20)`
-/// (21 bits; `|score| <= INF = 1M < 2^20`), bits 37–44 depth, 45–46 flag.
-fn pack_tt(best: Option<Move>, score: i32, depth: u8, flag: u8) -> u64 {
+/// (21 bits; `|score| <= INF = 1M < 2^20`), bits 37–44 depth, 45–46 flag,
+/// bits 47–62 generation (16 bits; 0 = cleared table, never a live search).
+fn pack_tt(best: Option<Move>, score: i32, depth: u8, flag: u8, generation: u16) -> u64 {
     let movecode: u64 = match best {
         None => 0,
         Some(mv) => {
@@ -117,10 +118,14 @@ fn pack_tt(best: Option<Move>, score: i32, depth: u8, flag: u8) -> u64 {
     debug_assert!(score.unsigned_abs() <= INF as u32);
     let score_field = (score as i64 + (1 << 20)) as u64;
     debug_assert!(score_field < (1 << 21));
-    movecode | score_field << 16 | (depth as u64) << 37 | ((flag as u64) & 3) << 45
+    movecode
+        | score_field << 16
+        | (depth as u64) << 37
+        | ((flag as u64) & 3) << 45
+        | (generation as u64) << 47
 }
 
-fn unpack_tt(data: u64) -> (Option<Move>, i32, u8, u8) {
+fn unpack_tt(data: u64) -> (Option<Move>, i32, u8, u8, u16) {
     let best = match (data & 0xFFFF) as u32 {
         0 => None,
         c => {
@@ -145,13 +150,18 @@ fn unpack_tt(data: u64) -> (Option<Move>, i32, u8, u8) {
     let score = ((data >> 16) & 0x1F_FFFF) as i32 - (1 << 20);
     let depth = ((data >> 37) & 0xFF) as u8;
     let flag = ((data >> 45) & 3) as u8;
-    (best, score, depth, flag)
+    let generation = (data >> 47) as u16;
+    (best, score, depth, flag, generation)
 }
 
 #[derive(Clone)]
 pub struct TT {
     slots: Arc<Vec<Slot>>,
     mask: usize,
+    /// Search generation, bumped by `new_search` at every `search_root`.
+    /// Shared across clones (one table = one counter). 0 means "cleared";
+    /// live searches run at 1..=u16::MAX with wraparound.
+    generation: Arc<AtomicU16>,
 }
 
 impl TT {
@@ -174,7 +184,22 @@ impl TT {
         TT {
             slots: Arc::new(v),
             mask: (n as usize) - 1,
+            generation: Arc::new(AtomicU16::new(0)),
         }
+    }
+
+    /// Start a new search generation. Call once per `search_root` so a fresh
+    /// search's entries outrank stale ones from previous searches/games on
+    /// replacement (same class of staleness as bench cross-position
+    /// pollution, but in real games). Wraps safely; 0 is reserved for
+    /// cleared tables.
+    pub fn new_search(&self) -> u16 {
+        let mut g = self.generation.load(Ordering::Relaxed).wrapping_add(1);
+        if g == 0 {
+            g = 1;
+        }
+        self.generation.store(g, Ordering::Relaxed);
+        g
     }
 
     pub fn clear(&self) {
@@ -183,6 +208,7 @@ impl TT {
             s.check.store(0, Ordering::Relaxed);
             s.key.store(0, Ordering::Relaxed);
         }
+        self.generation.store(0, Ordering::Relaxed);
     }
 
     pub fn hashfull(&self) -> u32 {
@@ -213,7 +239,7 @@ impl TT {
         if check != key ^ data ^ TT_SALT {
             return None;
         }
-        let (best, score, depth, flag) = unpack_tt(data);
+        let (best, score, depth, flag, _) = unpack_tt(data);
         Some(Entry {
             best,
             score,
@@ -224,15 +250,18 @@ impl TT {
 
     fn store(&self, key: u64, best: Option<Move>, score: i32, depth: u8, flag: u8) {
         let s = &self.slots[(key as usize) & self.mask];
+        let cur = self.generation.load(Ordering::Relaxed);
         if s.key.load(Ordering::Relaxed) == key {
-            // Same position: depth-preferred replacement. An unverified
-            // (torn) triple counts as an empty slot so it never blocks a
-            // fresh store; otherwise keep the deeper entry.
+            // Same position: a fresh generation always supersedes a stale
+            // entry (this search's own lines outrank last game's deep ones);
+            // within one generation keep the deeper entry as before. An
+            // unverified (torn) triple counts as an empty slot so it never
+            // blocks a fresh store.
             let old_data = s.data.load(Ordering::Relaxed);
             let old_check = s.check.load(Ordering::Relaxed);
             if old_check == key ^ old_data ^ TT_SALT {
-                let old_depth = ((old_data >> 37) & 0xFF) as u8;
-                if depth < old_depth {
+                let (_, _, old_depth, _, old_gen) = unpack_tt(old_data);
+                if old_gen == cur && depth < old_depth {
                     return;
                 }
             }
@@ -240,7 +269,7 @@ impl TT {
         // Empty slots and key collisions always store. Order: data, check,
         // key last — a reader that observes the new key (Acquire) also sees
         // the new data/check, and any torn mix fails the xor check as a miss.
-        let data = pack_tt(best, score, depth, flag);
+        let data = pack_tt(best, score, depth, flag, cur);
         s.data.store(data, Ordering::Relaxed);
         s.check.store(key ^ data ^ TT_SALT, Ordering::Relaxed);
         s.key.store(key, Ordering::Release);
@@ -273,6 +302,9 @@ pub fn search_root(
     threads: usize,
     poll: &mut dyn FnMut() -> bool,
 ) -> SearchResult {
+    // Fresh generation per search: this search's stores outrank stale
+    // entries from previous searches on replacement.
+    tt.new_search();
     let n = threads.clamp(1, 256);
     // Shared by value, never shared by reference: each thread builds its own
     // `Instant` deadline from this (Instants are not shareable).
@@ -1147,11 +1179,15 @@ mod tests {
             for &score in &scores {
                 for &depth in &[0u8, 1, 6, 64, 255] {
                     for &flag in &[TT_EXACT, TT_LOWER, TT_UPPER] {
-                        let (b2, s2, d2, f2) = unpack_tt(pack_tt(best, score, depth, flag));
-                        assert_eq!(b2, best, "move {best:?} score {score}");
-                        assert_eq!(s2, score);
-                        assert_eq!(d2, depth);
-                        assert_eq!(f2, flag);
+                        for &generation in &[0u16, 1, 255, 32768, 65535] {
+                            let (b2, s2, d2, f2, g2) =
+                                unpack_tt(pack_tt(best, score, depth, flag, generation));
+                            assert_eq!(b2, best, "move {best:?} score {score}");
+                            assert_eq!(s2, score);
+                            assert_eq!(d2, depth);
+                            assert_eq!(f2, flag);
+                            assert_eq!(g2, generation);
+                        }
                     }
                 }
             }
@@ -1202,6 +1238,33 @@ mod tests {
         tt.store(1000 + n, Some(m2), 22, 1, TT_EXACT);
         assert!(tt.probe(1000).is_none(), "evicted key must miss");
         assert_eq!(tt.probe(1000 + n).unwrap().best, Some(m2));
+    }
+
+    #[test]
+    fn tt_generation_prefers_fresh() {
+        // P2: a new search generation supersedes stale entries even when
+        // shallower; within one generation depth still rules.
+        let tt = TT::new(1);
+        let m1 = Move::new(8, 16, None);
+        let m2 = Move::new(9, 17, None);
+        // Generation 0: deep entry stored.
+        tt.store(42, Some(m1), 10, 9, TT_EXACT);
+        assert_eq!(tt.probe(42).unwrap().best, Some(m1));
+        // New search: shallow store wins over the stale deep entry.
+        assert_eq!(tt.new_search(), 1);
+        tt.store(42, Some(m2), 20, 1, TT_EXACT);
+        let e = tt.probe(42).unwrap();
+        assert_eq!((e.best, e.depth), (Some(m2), 1));
+        // Same generation: deeper still replaces, shallower does not.
+        tt.store(42, Some(m1), 10, 5, TT_EXACT);
+        assert_eq!(tt.probe(42).unwrap().depth, 5);
+        tt.store(42, Some(m2), 20, 3, TT_EXACT);
+        assert_eq!(tt.probe(42).unwrap().depth, 5);
+        // Clear resets to generation 0 with a clean slate (next search
+        // is generation 1 again).
+        tt.clear();
+        assert!(tt.probe(42).is_none());
+        assert_eq!(tt.new_search(), 1);
     }
 
     #[test]
