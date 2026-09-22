@@ -1,9 +1,11 @@
 //! Static evaluation: material + piece-square tables (white perspective),
-//! plus a small bishop-pair bonus.
+//! pawn structure, rook bonuses, mobility, king safety (pawn shield + king
+//! attack), plus bishop-pair and tempo bonuses.
 
-use crate::bitboard::pop_lsb;
+use crate::bitboard::{
+    bishop_attacks, bit, king_attacks, knight_attacks, pop_lsb, queen_attacks, rook_attacks,
+};
 use crate::board::Board;
-use crate::movegen::mobility_count;
 use crate::types::*;
 
 const PIECE_TYPES: [PieceType; 6] = [
@@ -121,6 +123,97 @@ fn mobility_weight(pt: PieceType) -> i32 {
         PieceType::Queen => MOB_QUEEN,
         _ => 0,
     }
+}
+
+/// Weight per enemy piece attacking the king ring (squares adjacent to the
+/// enemy king). Queens and rooks break shields; minors harass. Kings never
+/// count (they cannot approach). Pawns count: storms matter.
+fn attacker_weight(pt: PieceType) -> i32 {
+    match pt {
+        PieceType::Pawn => 1,
+        PieceType::Knight | PieceType::Bishop => 2,
+        PieceType::Rook => 3,
+        PieceType::Queen => 5,
+        PieceType::King => 0,
+    }
+}
+
+/// Centipawns per attack unit at full middlegame (tapered by phase/24, so
+/// bare-king endgames feel nothing). 10cp keeps a Q+R+B battery (~10 units
+/// = 100cp) decisive without drowning material: calibrated against the
+/// Dragon loss (19...Bc8 allowed Qh6/Bxf5/Rg1 converging on h8 with zero
+/// eval pushback) and gated by self-play.
+const KING_ATTACK_UNIT: i32 = 10;
+
+/// Forward pawn attack set (squares this pawn could capture on).
+fn pawn_attacks_fwd(sq: u8, color: Color) -> u64 {
+    let f = file_of(sq) as i8;
+    let r = rank_of(sq) as i8;
+    let mut bb = 0u64;
+    match color {
+        Color::White => {
+            if r < 7 {
+                if f > 0 {
+                    bb |= bit(((r + 1) * 8 + (f - 1)) as u8);
+                }
+                if f < 7 {
+                    bb |= bit(((r + 1) * 8 + (f + 1)) as u8);
+                }
+            }
+        }
+        Color::Black => {
+            if r > 0 {
+                if f > 0 {
+                    bb |= bit(((r - 1) * 8 + (f - 1)) as u8);
+                }
+                if f < 7 {
+                    bb |= bit(((r - 1) * 8 + (f + 1)) as u8);
+                }
+            }
+        }
+    }
+    bb
+}
+
+/// Attack set for one known piece (raw: first blocker of either color
+/// included for sliders, leapers occupancy-free). Shared by the mobility
+/// count (`& !own` masked by the caller) and the king-ring test below, so
+/// sliders walk each ray once instead of twice.
+fn piece_attack_set(board: &Board, sq: u8, color: Color, pt: PieceType) -> u64 {
+    match pt {
+        PieceType::Pawn => pawn_attacks_fwd(sq, color),
+        PieceType::Knight => knight_attacks(sq),
+        PieceType::Bishop => bishop_attacks(sq, board.occ_all),
+        PieceType::Rook => rook_attacks(sq, board.occ_all),
+        PieceType::Queen => queen_attacks(sq, board.occ_all),
+        PieceType::King => 0,
+    }
+}
+
+/// Attack units on `victim`'s king ring by `attacker`'s pieces (helper for
+/// tests; `evaluate` folds the same math into its main loop).
+#[cfg(test)]
+fn ring_pressure(board: &Board, victim: Color) -> i32 {
+    let ksq = match board.king_sq(victim) {
+        Some(k) => k,
+        None => return 0,
+    };
+    let zone = king_attacks(ksq);
+    let attacker = victim.opposite();
+    let mut units = 0;
+    for pt in PIECE_TYPES {
+        if pt == PieceType::King {
+            continue;
+        }
+        let mut bb = board.pieces[attacker.idx()][pt.idx()];
+        while bb != 0 {
+            let sq = pop_lsb(&mut bb);
+            if piece_attack_set(board, sq, attacker, pt) & zone != 0 {
+                units += attacker_weight(pt);
+            }
+        }
+    }
+    units
 }
 
 const ISOLATED_PENALTY: i32 = -12;
@@ -460,8 +553,9 @@ fn rook_bonus(color: Color, r: usize, f: usize, own: &[u8; 8], enemy: &[u8; 8]) 
 /// shelters early, activates late), pawn structure (passed / isolated /
 /// doubled, passers scored by king distance to promotion), rooks on open
 /// files and on the 7th rank, piece mobility (N/B/R/Q pseudo-legal move
-/// counts), king safety (pawn-shield presence, faded out in the endgame),
-/// plus a small bishop-pair bonus and a side-to-move tempo bonus. All
+/// counts), king safety (pawn-shield presence plus weighted enemy attacks on
+/// the king ring, both faded out in the endgame), plus a small bishop-pair
+/// bonus and a side-to-move tempo bonus. All
 /// terms are symmetric, so symmetric positions differ only by the tempo
 /// term (startpos evaluates to exactly TEMPO).
 pub fn evaluate(board: &Board) -> i32 {
@@ -499,6 +593,12 @@ pub fn evaluate(board: &Board) -> i32 {
     let mut score = 0i32;
     let mut white_bishops = 0;
     let mut black_bishops = 0;
+    // King rings (adjacent squares) for the attack term; 0 when the king is
+    // missing (some tests use kingless boards for structure terms).
+    let w_zone = white_king.map_or(0, king_attacks);
+    let b_zone = black_king.map_or(0, king_attacks);
+    let mut w_atk = 0i32;
+    let mut b_atk = 0i32;
     for color in [Color::White, Color::Black] {
         for pt in PIECE_TYPES {
             let mut bb = board.pieces[color.idx()][pt.idx()];
@@ -515,6 +615,13 @@ pub fn evaluate(board: &Board) -> i32 {
                 }
                 let r = rank_of(sq) as usize;
                 let f = file_of(sq) as usize;
+                // Shared attack set: mobility source + king-ring probe, so
+                // sliders walk each ray once instead of twice.
+                let atk = piece_attack_set(board, sq, color, pt);
+                let enemy_zone = match color {
+                    Color::White => b_zone,
+                    Color::Black => w_zone,
+                };
                 // All piece tables taper middlegame → endgame; kings use
                 // the dedicated tapered table below.
                 let mut u = match pt {
@@ -548,9 +655,22 @@ pub fn evaluate(board: &Board) -> i32 {
                 }
                 match pt {
                     PieceType::Knight | PieceType::Bishop | PieceType::Rook | PieceType::Queen => {
-                        u += mobility_weight(pt) * mobility_count(board, sq, color, pt) as i32;
+                        // Mobility from the shared attack set below (masked
+                        // by own occupancy — counts are identical to the old
+                        // `mobility_count` helper).
+                        u += mobility_weight(pt)
+                            * (atk & !board.occ[color.idx()]).count_ones() as i32;
                     }
                     _ => {}
+                }
+                // King-ring pressure: this piece attacks a square adjacent
+                // to the enemy king (each piece counts once no matter how
+                // many ring squares it hits).
+                if atk & enemy_zone != 0 {
+                    match color {
+                        Color::White => w_atk += attacker_weight(pt),
+                        Color::Black => b_atk += attacker_weight(pt),
+                    }
                 }
                 match color {
                     Color::White => score += u,
@@ -565,6 +685,10 @@ pub fn evaluate(board: &Board) -> i32 {
     if black_bishops >= 2 {
         score -= 30;
     }
+    // King attack: weighted enemy pressure on the king ring (adjacent
+    // squares), full strength in the middlegame, gone with bare kings —
+    // same taper as the shield term. Each attacking piece counts once.
+    score += (w_atk - b_atk) * KING_ATTACK_UNIT * phase / 24;
     // King safety: pawn-shield difference, full weight in the middlegame,
     // fading out as pieces come off (phase scaling like the king PST).
     let w_shield = white_king.map_or(0, |k| king_shield_sq(board, k, Color::White));
@@ -731,7 +855,82 @@ mod tests {
         // (corner in both MG and EG tables), mobility 2 moves x 2 = 4,
         // kings cancel (both tapered to -28), knight undeveloped (no dev
         // bonus), tempo +12. Total: 320 - 50 + 4 + 12 = 286.
+        // (Na1 attacks b3/c2 — nowhere near the black king ring, so the
+        // king-attack term is 0 here.)
         let b = Board::from_fen("4k3/8/8/8/8/8/8/N3K3 w - - 0 1").unwrap();
         assert_eq!(evaluate(&b), 286);
+    }
+
+    #[test]
+    fn attack_sets_match_mobility() {
+        // `piece_attack_set` (& !own popcount) is the mobility source now
+        // that the old `movegen::mobility_count` helper is retired: same
+        // cases, same counts. Knight d4: 8; knight a1: b3 + c2 = 2.
+        use crate::types::{Color::*, PieceType::*};
+        let mob = |fen: &str, sq: u8, side: Color, pt: PieceType| -> u32 {
+            let b = Board::from_fen(fen).unwrap();
+            (piece_attack_set(&b, sq, side, pt) & !b.occ[side.idx()]).count_ones()
+        };
+        assert_eq!(mob("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1", 27, White, Knight), 8);
+        assert_eq!(mob("4k3/8/8/8/8/8/8/N3K3 w - - 0 1", 0, White, Knight), 2);
+        // Bishop d4 on an open board: 13; fully blocked by own pawns: 0.
+        assert_eq!(
+            mob("4k3/8/8/8/3B4/8/8/4K3 w - - 0 1", 27, White, Bishop),
+            13
+        );
+        assert_eq!(
+            mob("4k3/8/8/2P1P3/3B4/2P1P3/8/4K3 w - - 0 1", 27, White, Bishop),
+            0
+        );
+        // Rook d4: 14; queen d4: 13 + 14 = 27.
+        assert_eq!(mob("4k3/8/8/8/3R4/8/8/4K3 w - - 0 1", 27, White, Rook), 14);
+        assert_eq!(mob("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1", 27, White, Queen), 27);
+        // Pawn attack sets: e2 eyes d3/f3; a7 (black) eyes b6 only.
+        let b = Board::new_startpos();
+        assert_eq!(piece_attack_set(&b, 12, White, Pawn).count_ones(), 2);
+        assert_eq!(piece_attack_set(&b, 48, Black, Pawn).count_ones(), 1);
+    }
+
+    #[test]
+    fn king_ring_pressure_counts() {
+        // Dragon loss, after 19...Bc8 (White to play 20.Qh6): Qh3 + Bf5
+        // converge on h7, Rg1 x-rays g7/g8 down the open file. No black
+        // piece pressures the white ring (Ke1, far away).
+        let b =
+            Board::from_fen("r1bqrn1k/p1p1b2p/1p6/n2pPB2/3P1P2/2P2N1Q/PP5P/R1B1K1R1 w Q - 3 20")
+                .unwrap();
+        assert_eq!(ring_pressure(&b, Color::Black), 5 + 3 + 2);
+        assert_eq!(ring_pressure(&b, Color::White), 0);
+        // Startpos: nothing near either ring.
+        let s = Board::new_startpos();
+        assert_eq!(ring_pressure(&s, Color::Black), 0);
+        assert_eq!(ring_pressure(&s, Color::White), 0);
+        // Bare kings: no attackers at all (term also tapers to 0 by phase).
+        let k = Board::from_fen("4k3/8/8/8/4K3/8/8/8 w - - 0 1").unwrap();
+        assert_eq!(ring_pressure(&k, Color::Black), 0);
+        assert_eq!(ring_pressure(&k, Color::White), 0);
+        // Own pieces on the ring don't count: black rook eyes its own
+        // king's ring (Rf8-adjacent f8 via Ra8) — only ENEMY pieces score.
+        let own = Board::from_fen("r5k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1").unwrap();
+        assert_eq!(ring_pressure(&own, Color::Black), 0);
+        assert_eq!(ring_pressure(&own, Color::White), 0);
+    }
+
+    #[test]
+    fn king_attack_moves_eval() {
+        // Same material (Q+K vs k), queen pressuring the ring (Qf2 eyes
+        // f7/f8) must outscore a quiet queen (Qa1 reaches nothing).
+        let pressing = Board::from_fen("4k3/8/8/8/8/8/5Q2/4K3 w - - 0 1").unwrap();
+        let quiet = Board::from_fen("4k3/8/8/8/8/8/8/Q3K3 w - - 0 1").unwrap();
+        assert!(ring_pressure(&pressing, Color::Black) > 0);
+        assert_eq!(ring_pressure(&quiet, Color::Black), 0);
+        assert!(evaluate(&pressing) > evaluate(&quiet));
+        // Dragon position: the attack term alone is ~+95 White (10 units
+        // x 10cp x phase 23/24), so static eval must clearly favor White
+        // even before search sees the mate.
+        let d =
+            Board::from_fen("r1bqrn1k/p1p1b2p/1p6/n2pPB2/3P1P2/2P2N1Q/PP5P/R1B1K1R1 w Q - 3 20")
+                .unwrap();
+        assert!(evaluate(&d) > 100, "dragon eval {}", evaluate(&d));
     }
 }

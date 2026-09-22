@@ -211,21 +211,6 @@ fn gen_pawn_captures(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) 
     }
 }
 
-/// Pseudo-legal destination count for one known piece, for eval mobility.
-/// Counts quiet + capture destinations via attack-set popcounts (not
-/// legality-checked). Callers (eval) iterate piece boards, so the piece is
-/// already identified; pawns/kings are never queried (return 0).
-pub fn mobility_count(board: &Board, sq: u8, side: Color, pt: PieceType) -> u32 {
-    let free = !board.occ[side.idx()];
-    match pt {
-        PieceType::Knight => (knight_attacks(sq) & free).count_ones(),
-        PieceType::Bishop => (bishop_attacks(sq, board.occ_all) & free).count_ones(),
-        PieceType::Rook => (rook_attacks(sq, board.occ_all) & free).count_ones(),
-        PieceType::Queen => (queen_attacks(sq, board.occ_all) & free).count_ones(),
-        _ => 0,
-    }
-}
-
 fn gen_castling(board: &Board, side: Color, moves: &mut Vec<Move>) {
     let si = side.idx();
     let kings = board.pieces[si][PieceType::King.idx()];
@@ -536,31 +521,6 @@ mod tests {
         let fen = "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1";
         assert_eq!(perft_fen(fen, 4), 43_238);
         assert_eq!(perft_fen(fen, 5), 674_624);
-    }
-
-    #[test]
-    fn mobility_counts() {
-        use Color::*;
-        use PieceType::*;
-        // Knight d4: 8; knight a1: b3 + c2 = 2.
-        let b = Board::from_fen("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1").unwrap();
-        assert_eq!(mobility_count(&b, 27, White, Knight), 8);
-        let b = Board::from_fen("4k3/8/8/8/8/8/8/N3K3 w - - 0 1").unwrap();
-        assert_eq!(mobility_count(&b, 0, White, Knight), 2);
-        // Bishop d4 on an open board: 13; fully blocked by own pawns: 0.
-        let b = Board::from_fen("4k3/8/8/8/3B4/8/8/4K3 w - - 0 1").unwrap();
-        assert_eq!(mobility_count(&b, 27, White, Bishop), 13);
-        let b = Board::from_fen("4k3/8/8/2P1P3/3B4/2P1P3/8/4K3 w - - 0 1").unwrap();
-        assert_eq!(mobility_count(&b, 27, White, Bishop), 0);
-        // Rook d4: 14; queen d4: 13 + 14 = 27.
-        let b = Board::from_fen("4k3/8/8/8/3R4/8/8/4K3 w - - 0 1").unwrap();
-        assert_eq!(mobility_count(&b, 27, White, Rook), 14);
-        let b = Board::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 0 1").unwrap();
-        assert_eq!(mobility_count(&b, 27, White, Queen), 27);
-        // Pawns and kings count 0.
-        let b = Board::new_startpos();
-        assert_eq!(mobility_count(&b, 8, White, Pawn), 0);
-        assert_eq!(mobility_count(&b, 4, White, King), 0);
     }
 
     fn sort_moves(moves: &mut [Move]) {

@@ -12,7 +12,8 @@ contributor rules in `AGENTS.md`; roadmap in `plan.md` (local-only).
 |---|---|
 | `types.rs` | `Color`, `PieceType`, `Move{from,to,promotion}`, square helpers (`0=a1`) |
 | `board.rs` | `pieces[[u64;6];2]` + `occ[2]` + `occ_all`, FEN, Zobrist, `make/unmake_move/null`, `Undo`, draw state |
-| `movegen.rs` | `generate_pseudo/legal/captures`, `mobility_count`, `perft`, `ep_capture_ok`, `see` |
+| `movegen.rs` | `generate_pseudo/legal/captures`, `perft`, `ep_capture_ok`, `see` |
+| `eval.rs` | `evaluate()` (White view), tapered PSTs, structure/mobility/shield/ring-attack, `TEMPO` |
 | `eval.rs` | `evaluate()` (White view), tapered PSTs, structure/mobility/shield, `TEMPO` |
 | `search.rs` | `search_root`, `negamax`, `quiescence`, lock-free `TT`, Lazy SMP, `Limits` |
 | `uci.rs` | `Engine`, command loop, `parse_go`, `apply_position`, `BENCH_FENS` |
@@ -32,6 +33,7 @@ contributor rules in `AGENTS.md`; roadmap in `plan.md` (local-only).
 | LMR | depth ≥ 3, late quiets −1 (−2 if depth ≥ 6, i ≥ 8) | Re-search on alpha exceed |
 | QSearch delta margin | 150 | Captures skipped if SEE+static+150 ≤ alpha (promos never) |
 | History | ±depth², clamp ±1,000,000 | Bonus on cutoff, gravity malus on quiet fail-low |
+| King-ring attack | P/N/B/R/Q = 1/2/2/3/5 per attacker, ×10cp ×phase/24 | Enemy attacks on adjacent squares; each piece once |
 | Ordering scores | hash 10M, promo 900k+victim·10, SEE≥0 captures MVV-LVA 1M+victim·10−attacker, killers 800k/790k, counter 785k, losing captures 700k+SEE | |
 | Time | `movetime−(mt/10∈[30,200])`; clocks `own/min(movestogo,50)+inc/2` minus reserve `(own/10∈[100,1000])`; soft deadline 65% | Bare `go` = depth 6 |
 
@@ -50,19 +52,21 @@ Mate scores ply-adjusted (store +, probe −); root stores every iteration
 
 | Check | Expected |
 |---|---|
-| `cargo test` | 46 passed |
+| `cargo test` | 48 passed |
 | `perft 4` startpos | 197281 (~25ms release) |
 | Kiwipete d3 / pos3 / endgame | 97862 / exact / exact (see tests) |
-| `bench 8` | 784,554 nodes, ~590–620k nps (±8% run noise) |
-| Gates | tapered kept; gravity 32–19–9 (+76 ±92); 200-game attempt exposed EP bug; TT aging neutral (52–48); SEE kept (23–21–16 @40/10, depth-12 Ba6>dxe6 proof) |
+| `bench 8` | 862,777 nodes, ~550–580k nps (±8% run noise) |
+| Gates | tapered kept; gravity 32–19–9 (+76 ±92); 200-game attempt exposed EP bug; TT aging neutral (52–48); SEE kept (23–21–16 @40/10, depth-12 Ba6>dxe6 proof); ring-attack kept (96–104 @40/10 neutral, Dragon sensed + Kirin f6 fixed) |
 
-## Test inventory (46)
+## Test inventory (48)
 
 perft: startpos d1–4, Kiwipete (+d4), pos3 deep, endgame, captures-vs-filter
 (+children) · eval: balance/symmetry (mirrored side), queen, passer
 (blocked/beats), isolated, rook-open, king-centralize, shield (unit +
-intact/cracked), passer-king-distance, in-square, mobility · TT: pack
-round-trip, probe/store/collision, generation-prefers-fresh, threaded smoke,
-SMP legality · SEE: hanging/defended/pawn-takes-queen/even-exchange/
-xray-pair/EP/promotions, losing-capture-sorts-below-killer · board:
-make/unmake round-trip (+promotion), repetition counts, stale-EP phantom.
+intact/cracked), passer-king-distance, in-square, mobility, attack-sets
+(mobility equivalence), ring-pressure (Dragon 10-vs-0), king-attack-moves-eval
+· TT: pack round-trip, probe/store/collision, generation-prefers-fresh,
+threaded smoke, SMP legality · SEE: hanging/defended/pawn-takes-queen/
+even-exchange/xray-pair/EP/promotions, losing-capture-sorts-below-killer
+· board: make/unmake round-trip (+promotion), repetition counts, stale-EP
+phantom.

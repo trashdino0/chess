@@ -93,8 +93,9 @@ Generation is two stages: `generate_pseudo()` emits pseudo-legal moves
 along ranks/files/diagonals), then `generate_legal()` keeps only those that
 leave the mover's king safe (make → `in_check` → unmake). Quiescence search
 uses a cheaper path: `generate_pseudo_captures()` emits captures, EP, and
-all promotions only, legality-checked by `generate_captures()`. Eval reuses
-the same attack logic allocation-free through `mobility_count()`.
+all promotions only, legality-checked by `generate_captures()`. Eval owns
+the shared attack-set helper `piece_attack_set()` (one ray-walk per slider
+feeding both mobility counts and the king-ring term).
 
 **EP rule that matters.** An en-passant capture is generated only if the
 target *is* the EP square **and** an enemy pawn actually stands on the jumped
@@ -146,6 +147,7 @@ queens mildly centralize.
 | Mobility per pseudo-legal destination (N/B/R/Q) | +2/+2/+2/+1 |
 | Developed minor / central minor | +6 / +4 |
 | Pawn shield (home king, 3 files × +8 one rank ahead / +4 two ahead) | middlegame-weighted |
+| King-ring attack (enemy P/N/B/R/Q weight 1/2/2/3/5 on adjacent squares) | `(w−b) × 10 × phase/24` |
 | Bishop pair | +30 |
 | Tempo (side-to-move bonus) | `TEMPO = 12` |
 
@@ -260,14 +262,16 @@ sessions interactively or via GUI.
 
 **CLI shortcuts** (deterministic, single-threaded — preferred for testing):
 `perft <depth> [fen]`, `search <depth> [fen]`, `bench [depth]`
-(10-FEN suite, currently 2,909,536 nodes at depth 8).
+(10-FEN suite, currently 862,777 nodes at depth 8).
 
 ---
 
 ## 6. Testing and measuring strength
 
-- `cargo test` (34 tests): perft suites, eval pins, TT pack/probe/threads,
-  make/unmake round-trips incl. the EP regression, repetition counting.
+- `cargo test` (48 tests): perft suites, eval pins (incl. king-ring pressure
+  on the Dragon loss position), TT pack/probe/generation/threads, SEE
+  tactics, make/unmake round-trips incl. the EP regression, repetition
+  counting.
 - **Bench discipline:** compare back-to-back binaries (nps noise is ±8%);
   fixed-depth node/bestmove wobble is TT-luck, so judge ordering by trends
   and strength by games, never by single fixed-depth numbers. The shared TT
@@ -277,8 +281,11 @@ sessions interactively or via GUI.
   ≈ ±90 Elo (catches crashes/disasters), 200 games ≈ ±50 (keep/revert
   calls). Always read terminations — illegal moves, disconnects, and
   forfeits say more than the score. History so far: tapered eval kept,
-  history gravity kept at 32–19–9, and one 200-game attempt famously exposed
-  the phantom-EP bug instead.
+  history gravity kept at 32–19–9, one 200-game attempt famously exposed
+  the phantom-EP bug instead, TT aging neutral (52–48), SEE kept
+  (23–21–16 @40/10), king-ring attack neutral (96–104 @40/10) but kept:
+  zero anomalies plus pinned analytical wins (Dragon mate-now-sensed,
+  Kirin f6-blunder gone at depth 12).
 - **Ground truth:** no absolute rating yet. Candidates: a TSCP anchor gate
   (≈1800) or the lichess BOT account playing rated rapid/classical — see
   `plan.md`. Rough human-pool estimate today: ~1700–2100 depending on time
@@ -289,8 +296,8 @@ sessions interactively or via GUI.
 ## 7. Known limitations (see `plan.md` for the fix list)
 
 Zero crates by design (no SIMD, no NNUE-style eval); full recompute of the
-Zobrist hash per make; `generate_legal` allocates a vector per node; TT has
-no generation aging; no SEE yet; no opening book or tablebases in-engine
+Zobrist hash per make; `generate_legal` allocates a vector per node; no
+opening book or tablebases in-engine
 (the lichess bridge can supply books externally); time margins are thin for
 bullet; `openings.epd` contains one synthetic illegal-ish French line with a
 stale EP square (kept deliberately as phantom-EP coverage).
