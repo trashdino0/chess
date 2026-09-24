@@ -12,7 +12,7 @@ Requires `cargo` (Windows PowerShell 5.1; prefix if not on `PATH`):
 ```powershell
 $env:Path = "$env:USERPROFILE\.cargo\bin;" + $env:Path
 cargo build --release   # GUI binary: target\release\chess-engine.exe
-cargo test              # 48 tests: perft + eval + TT + make/unmake
+cargo test              # 49 tests: perft + eval + TT + make/unmake
 
 # CLI shortcuts (deterministic, single-threaded — preferred for testing):
 .\target\release\chess-engine.exe perft 4

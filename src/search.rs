@@ -407,6 +407,14 @@ fn helper_search(board: &mut Board, tt: &TT, limits: &Limits, tid: usize, shared
     shared.nodes[tid].store(res.nodes, Ordering::Relaxed);
 }
 
+/// Zeroed history box allocated directly on the heap. `Box::new([...])`
+/// would first build the 2MB array as a stack temporary and overflow
+/// small-stack threads (notably the test harness); zeroed i32s are valid.
+fn zero_hist() -> Box<[[[[i32; 64]; 64]; 64]; 2]> {
+    // SAFETY: all-zeroes is a valid bit pattern for `i32`.
+    unsafe { Box::new_zeroed().assume_init() }
+}
+
 struct Searcher {
     tt: TT,
     killers: [[Option<Move>; 2]; MAX_PLY + 8],
@@ -414,6 +422,14 @@ struct Searcher {
     /// Countermove table: for the previous move's from/to, the quiet move
     /// that last caused a cutoff in reply.
     counter: [[Option<Move>; 64]; 64],
+    /// Counter-history: [side][prev move's to][reply from][reply to] —
+    /// which replies to a given enemy landing square cause cutoffs.
+    /// Follow-up history: [side][own previous move's to][move from][to] —
+    /// which moves follow our own previous play. Both use the same
+    /// ±depth² gravity as `history` (bonus on cutoff, malus on fail-low).
+    /// Boxed: 2MB each — far too big for the searcher struct on the stack.
+    counter_hist: Box<[[[[i32; 64]; 64]; 64]; 2]>,
+    follow_hist: Box<[[[[i32; 64]; 64]; 64]; 2]>,
     /// Move stack: `stack[ply]` is the move played from the node at `ply`
     /// (None for null moves / above the root); sized past MAX_PLY so
     /// quiescence (capped at MAX_PLY + 24) can index it too.
@@ -443,6 +459,8 @@ impl Searcher {
             killers: [[None; 2]; MAX_PLY + 8],
             history: [[[0; 64]; 64]; 2],
             counter: [[None; 64]; 64],
+            counter_hist: zero_hist(),
+            follow_hist: zero_hist(),
             stack: [None; MAX_PLY + 32],
             nodes: 0,
             seldepth: 0,
@@ -497,10 +515,13 @@ impl Searcher {
             &mut root_moves,
             None,
             None,
+            None,
             0,
             &self.killers,
             &self.history,
             &self.counter,
+            &self.counter_hist,
+            &self.follow_hist,
         );
 
         let mut best = root_moves[0];
@@ -642,7 +663,8 @@ impl Searcher {
                 && Some(mv.to) != board.ep
                 && mv.promotion.is_none();
             if quiet && failed_low {
-                self.history_malus(board.side, mv, depth);
+                // Root moves have no previous play to decay against.
+                self.history_malus(board.side, mv, None, None, depth);
             }
         }
         Ok((best_score, best))
@@ -767,15 +789,19 @@ impl Searcher {
             return Ok(0);
         }
         let prev = if ply > 0 { self.stack[ply - 1] } else { None };
+        let own_prev = if ply >= 2 { self.stack[ply - 2] } else { None };
         order_moves(
             board,
             &mut moves,
             hash_move,
             prev,
+            own_prev,
             ply,
             &self.killers,
             &self.history,
             &self.counter,
+            &self.counter_hist,
+            &self.follow_hist,
         );
 
         let mut best_move = None;
@@ -859,7 +885,7 @@ impl Searcher {
             // (`is_cap` was computed pre-move; killers are quiet by
             // construction and take the malus like any other quiet.)
             if !is_cap && failed_low && ply < MAX_PLY {
-                self.history_malus(board.side, mv, depth);
+                self.history_malus(board.side, mv, prev, own_prev, depth);
             }
         }
 
@@ -929,15 +955,23 @@ impl Searcher {
         } else {
             None
         };
+        let own_prev = if ply >= 2 && ply - 2 < self.stack.len() {
+            self.stack[ply - 2]
+        } else {
+            None
+        };
         order_moves(
             board,
             &mut ordered,
             None,
             prev,
+            own_prev,
             ply,
             &self.killers,
             &self.history,
             &self.counter,
+            &self.counter_hist,
+            &self.follow_hist,
         );
 
         for mv in ordered {
@@ -991,19 +1025,51 @@ impl Searcher {
         }
         let h = &mut self.history[side.idx()][mv.from as usize][mv.to as usize];
         *h = (*h + depth * depth).min(1_000_000);
-        // Countermove: reply `mv` to the move that led here.
+        // Countermove: reply `mv` to the move that led here, plus
+        // counter-history for the enemy landing square.
         if ply >= 1 {
             if let Some(pm) = self.stack[ply - 1] {
                 self.counter[pm.from as usize][pm.to as usize] = Some(mv);
+                let c = &mut self.counter_hist[side.idx()][pm.to as usize][mv.from as usize]
+                    [mv.to as usize];
+                *c = (*c + depth * depth).min(1_000_000);
+            }
+        }
+        // Follow-up history: `mv` follows our own previous play two plies
+        // back (same side to move then as now).
+        if ply >= 2 {
+            if let Some(op) = self.stack[ply - 2] {
+                let f = &mut self.follow_hist[side.idx()][op.to as usize][mv.from as usize]
+                    [mv.to as usize];
+                *f = (*f + depth * depth).min(1_000_000);
             }
         }
     }
 
     /// History gravity: quiet fail-lows decay toward `-1_000_000`, mirroring
     /// the `+depth²` bonus (clamped at `+1_000_000`) in `note_cutoff`.
-    fn history_malus(&mut self, side: Color, mv: Move, depth: i32) {
+    /// Counter-history and follow-up entries decay with the same malus so no
+    /// table can outrank newly-good moves forever.
+    fn history_malus(
+        &mut self,
+        side: Color,
+        mv: Move,
+        prev: Option<Move>,
+        own_prev: Option<Move>,
+        depth: i32,
+    ) {
         let h = &mut self.history[side.idx()][mv.from as usize][mv.to as usize];
         *h = (*h - depth * depth).max(-1_000_000);
+        if let Some(pm) = prev {
+            let c = &mut self.counter_hist[side.idx()][pm.to as usize][mv.from as usize]
+                [mv.to as usize];
+            *c = (*c - depth * depth).max(-1_000_000);
+        }
+        if let Some(op) = own_prev {
+            let f =
+                &mut self.follow_hist[side.idx()][op.to as usize][mv.from as usize][mv.to as usize];
+            *f = (*f - depth * depth).max(-1_000_000);
+        }
     }
 
     fn print_info(&mut self, board: &mut Board, depth: u8, score: i32, start: &Instant) {
@@ -1107,10 +1173,13 @@ fn order_moves(
     moves: &mut [Move],
     hash_move: Option<Move>,
     prev: Option<Move>,
+    own_prev: Option<Move>,
     ply: usize,
     killers: &[[Option<Move>; 2]; MAX_PLY + 8],
     history: &[[[i32; 64]; 64]; 2],
     counter: &[[Option<Move>; 64]; 64],
+    counter_hist: &[[[[i32; 64]; 64]; 64]; 2],
+    follow_hist: &[[[[i32; 64]; 64]; 64]; 2],
 ) {
     let side = board.side;
     // Countermove for the move that led here (quiet replies only).
@@ -1144,7 +1213,11 @@ fn order_moves(
                     s = 700_000 + exchange;
                 }
             } else {
-                // Quiet: killers, then countermove, then history.
+                // Quiet: killers, then countermove, then learned history.
+                // The learned score sums three gravity tables: plain
+                // history (good from/to regardless of context), counter-
+                // history (good reply to the enemy's landing square) and
+                // follow-up history (good follow to our own previous play).
                 if ply < killers.len() {
                     if killers[ply][0] == Some(mv) {
                         s = 800_000;
@@ -1154,6 +1227,14 @@ fn order_moves(
                         s = 785_000;
                     } else {
                         s = history[side.idx()][mv.from as usize][mv.to as usize];
+                        if let Some(pm) = prev {
+                            s += counter_hist[side.idx()][pm.to as usize][mv.from as usize]
+                                [mv.to as usize];
+                        }
+                        if let Some(op) = own_prev {
+                            s += follow_hist[side.idx()][op.to as usize][mv.from as usize]
+                                [mv.to as usize];
+                        }
                     }
                 }
             }
@@ -1355,9 +1436,11 @@ mod tests {
         killers[0][0] = Some(killer);
         let history = [[[0i32; 64]; 64]; 2];
         let counter = [[None; 64]; 64];
+        let no_ch = zero_hist();
         let mut moves = vec![capture, killer];
         order_moves(
-            &mut board, &mut moves, None, None, 0, &killers, &history, &counter,
+            &mut board, &mut moves, None, None, None, 0, &killers, &history, &counter, &no_ch,
+            &no_ch,
         );
         assert_eq!(moves[0], killer, "losing capture must sort below killer");
 
@@ -1373,12 +1456,74 @@ mod tests {
             &mut moves2,
             None,
             None,
+            None,
             0,
             &killers,
             &history,
             &counter,
+            &no_ch,
+            &no_ch,
         );
         assert_eq!(moves2[0], capture2, "winning capture must sort first");
+    }
+
+    #[test]
+    fn counter_follow_history_bonus_and_malus() {
+        // P4: quiet cutoff credits plain history AND the reply/follow-up
+        // tables; the gravity malus symmetrically decays all three.
+        let tt = TT::new(1);
+        let mut s = Searcher::new(tt, None, 10, 0, None, 1);
+        // Ply 1: enemy played e7e5 (52->36); our quiet reply d2d4 (11->27).
+        let prev = Move::new(52, 36, None);
+        let reply = Move::new(11, 27, None);
+        s.stack[0] = Some(prev);
+        let mut board = Board::new_startpos();
+        // d2d4 must read quiet on startpos (d4 empty, no promo, not EP).
+        s.note_cutoff(Color::White, reply, &board, 1, 3);
+        assert_eq!(s.history[Color::White.idx()][11][27], 9);
+        assert_eq!(s.counter_hist[Color::White.idx()][36][11][27], 9);
+        assert_eq!(s.counter[52][36], Some(reply));
+        // Ply 2: own previous was Ng1f3 (6->21); cutoff move replies again.
+        let own_prev = Move::new(6, 21, None);
+        s.stack[0] = Some(own_prev);
+        s.stack[1] = Some(prev);
+        s.note_cutoff(Color::White, reply, &board, 2, 3);
+        assert_eq!(s.follow_hist[Color::White.idx()][21][11][27], 9);
+        // Malus unwinds all three symmetrically.
+        s.history_malus(Color::White, reply, Some(prev), Some(own_prev), 3);
+        assert_eq!(s.history[Color::White.idx()][11][27], 9);
+        assert_eq!(s.counter_hist[Color::White.idx()][36][11][27], 9);
+        assert_eq!(s.follow_hist[Color::White.idx()][21][11][27], 0);
+        // Ordering: a reply with counter-history outranks a plain-history
+        // move with a higher base score, but stays below killers.
+        let killers = [[None; 2]; MAX_PLY + 8];
+        let mut hist = [[[0i32; 64]; 64]; 2];
+        hist[Color::White.idx()][11][27] = 0;
+        let plain = Move::new(8, 24, None); // a2a4, quiet on startpos
+        hist[Color::White.idx()][8][24] = 4000;
+        let no_fh = zero_hist();
+        let mut ch = zero_hist();
+        ch[Color::White.idx()][36][11][27] = 5000;
+        let counter = [[None; 64]; 64];
+        let mut moves = vec![plain, reply];
+        board = Board::new_startpos();
+        order_moves(
+            &mut board,
+            &mut moves,
+            None,
+            Some(prev),
+            None,
+            1,
+            &killers,
+            &hist,
+            &counter,
+            &ch,
+            &no_fh,
+        );
+        assert_eq!(
+            moves[0], reply,
+            "counter-history must outrank plain history"
+        );
     }
 
     #[test]

@@ -194,11 +194,16 @@ is the `Hash` option in MB (default 16).
 hash move (10M) → promotions (900k + victim) → winning captures by MVV-LVA
 (`1M + victim×10 − attacker`, SEE ≥ 0) → EP → killers (800k/790k) →
 countermove (785k: the reply that worked last time after the previous move)
-→ losing captures (`700k + SEE`, below counter) → history score. The SEE
+→ losing captures (`700k + SEE`, below counter) → learned quiet score
+(history + counter-history + follow-up, summed). The SEE
 split demotes sacrifices like defended `QxP` (−800) to the back instead of
 fronting them on victim value. History gives `+depth²` (clamped +1M) to cutoff quiets and symmetric
 **gravity** `−depth²` (clamped −1M) to quiet fail-lows, in root and negamax —
-measured −4.9% bench nodes.
+plain table plus counter-history (`[side][prev-to][from][to]`: replies to an
+enemy landing square) plus follow-up history (`[side][own-prev-to][from][to]`),
+each boxed 2MB per thread (heap-zeroed: a 2MB array literal would overflow
+small-stack threads) — measured −4.6% bench nodes on top of the earlier
+−4.9% from gravity alone.
 
 **Pruning and reductions** (all verified by perft-exactness + gates, since
 each one risks cutting something real):
@@ -268,8 +273,9 @@ sessions interactively or via GUI.
 
 ## 6. Testing and measuring strength
 
-- `cargo test` (48 tests): perft suites, eval pins (incl. king-ring pressure
-  on the Dragon loss position), TT pack/probe/generation/threads, SEE
+- `cargo test` (49 tests): perft suites, eval pins (incl. king-ring pressure
+  on the Dragon loss position), ordering pins (counter/follow-up bonus +
+  malus), TT pack/probe/generation/threads, SEE
   tactics, make/unmake round-trips incl. the EP regression, repetition
   counting.
 - **Bench discipline:** compare back-to-back binaries (nps noise is ±8%);
@@ -285,7 +291,8 @@ sessions interactively or via GUI.
   the phantom-EP bug instead, TT aging neutral (52–48), SEE kept
   (23–21–16 @40/10), king-ring attack neutral (96–104 @40/10) but kept:
   zero anomalies plus pinned analytical wins (Dragon mate-now-sensed,
-  Kirin f6-blunder gone at depth 12).
+  Kirin f6-blunder gone at depth 12); counter/follow-history neutral
+  (97.5–102.5 @40/10, −4.6% bench nodes, zero anomalies) but kept.
 - **Ground truth:** no absolute rating yet. Candidates: a TSCP anchor gate
   (≈1800) or the lichess BOT account playing rated rapid/classical — see
   `plan.md`. Rough human-pool estimate today: ~1700–2100 depending on time

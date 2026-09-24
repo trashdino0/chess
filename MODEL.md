@@ -32,9 +32,9 @@ contributor rules in `AGENTS.md`; roadmap in `plan.md` (local-only).
 | LMP | depth ≤ 2, skip quiet i ≥ 6+depth·6 | Non-killers near leaves |
 | LMR | depth ≥ 3, late quiets −1 (−2 if depth ≥ 6, i ≥ 8) | Re-search on alpha exceed |
 | QSearch delta margin | 150 | Captures skipped if SEE+static+150 ≤ alpha (promos never) |
-| History | ±depth², clamp ±1,000,000 | Bonus on cutoff, gravity malus on quiet fail-low |
+| History | ±depth², clamp ±1,000,000 | Plain + counter-history + follow-up bonus on cutoff, gravity malus on quiet fail-low |
 | King-ring attack | P/N/B/R/Q = 1/2/2/3/5 per attacker, ×10cp ×phase/24 | Enemy attacks on adjacent squares; each piece once |
-| Ordering scores | hash 10M, promo 900k+victim·10, SEE≥0 captures MVV-LVA 1M+victim·10−attacker, killers 800k/790k, counter 785k, losing captures 700k+SEE | |
+| Ordering scores | hash 10M, promo 900k+victim·10, SEE≥0 captures MVV-LVA 1M+victim·10−attacker, killers 800k/790k, counter 785k, losing captures 700k+SEE, quiets history+ch+fh | |
 | Time | `movetime−(mt/10∈[30,200])`; clocks `own/min(movestogo,50)+inc/2` minus reserve `(own/10∈[100,1000])`; soft deadline 65% | Bare `go` = depth 6 |
 
 ## TT entry (63 packed bits + atomics)
@@ -52,11 +52,11 @@ Mate scores ply-adjusted (store +, probe −); root stores every iteration
 
 | Check | Expected |
 |---|---|
-| `cargo test` | 48 passed |
+| `cargo test` | 49 passed |
 | `perft 4` startpos | 197281 (~25ms release) |
 | Kiwipete d3 / pos3 / endgame | 97862 / exact / exact (see tests) |
-| `bench 8` | 862,777 nodes, ~550–580k nps (±8% run noise) |
-| Gates | tapered kept; gravity 32–19–9 (+76 ±92); 200-game attempt exposed EP bug; TT aging neutral (52–48); SEE kept (23–21–16 @40/10, depth-12 Ba6>dxe6 proof); ring-attack kept (96–104 @40/10 neutral, Dragon sensed + Kirin f6 fixed) |
+| `bench 8` | 823,390 nodes, ~545–570k nps (±8% run noise) |
+| Gates | tapered kept; gravity 32–19–9 (+76 ±92); 200-game attempt exposed EP bug; TT aging neutral (52–48); SEE kept (23–21–16 @40/10, depth-12 Ba6>dxe6 proof); ring-attack kept (96–104 @40/10 neutral, Dragon sensed + Kirin f6 fixed); counter/follow-history kept (97.5–102.5 @40/10 neutral, −4.6% bench nodes, zero anomalies) |
 
 ## Test inventory (48)
 
