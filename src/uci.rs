@@ -121,17 +121,14 @@ fn handle_command(
                     None => (after_name.trim().to_ascii_lowercase(), None),
                 };
                 if name == "hash" {
-                    if let Some(v) = value {
-                        if let Ok(mb) = v.parse::<usize>() {
-                            eng.set_hash(mb);
-                        }
+                    if let Some(v) = value && let Ok(mb) = v.parse::<usize>() {
+                        eng.set_hash(mb);
                     }
-                } else if name == "threads" {
-                    if let Some(v) = value {
-                        if let Ok(t) = v.parse::<usize>() {
-                            eng.threads = t.clamp(1, 256);
-                        }
-                    }
+                } else if name == "threads"
+                    && let Some(v) = value
+                    && let Ok(t) = v.parse::<usize>()
+                {
+                    eng.threads = t.clamp(1, 256);
                 }
                 // Other options accepted and ignored.
             }

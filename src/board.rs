@@ -294,7 +294,7 @@ impl Board {
                     None => empty += 1,
                     Some(p) => {
                         if empty > 0 {
-                            s.push(('0' as u8 + empty) as char);
+                            s.push((b'0' + empty) as char);
                             empty = 0;
                         }
                         s.push(p.to_char());
@@ -302,42 +302,38 @@ impl Board {
                 }
             }
             if empty > 0 {
-                s.push(('0' as u8 + empty) as char);
+                s.push((b'0' + empty) as char);
             }
             if r > 0 {
                 s.push('/');
             }
         }
-        s.push(if self.side == Color::White { ' ' } else { ' ' });
-        // rebuild properly:
-        let mut out = s;
-        out.pop(); // drop placeholder space handling, rewrite below
-        out.push(' ');
-        out.push(if self.side == Color::White { 'w' } else { 'b' });
-        out.push(' ');
+        s.push(' ');
+        s.push(if self.side == Color::White { 'w' } else { 'b' });
+        s.push(' ');
         if self.castling == 0 {
-            out.push('-');
+            s.push('-');
         } else {
             if self.castling & WK != 0 {
-                out.push('K');
+                s.push('K');
             }
             if self.castling & WQ != 0 {
-                out.push('Q');
+                s.push('Q');
             }
             if self.castling & BK != 0 {
-                out.push('k');
+                s.push('k');
             }
             if self.castling & BQ != 0 {
-                out.push('q');
+                s.push('q');
             }
         }
-        out.push(' ');
+        s.push(' ');
         match self.ep {
-            None => out.push('-'),
-            Some(sq) => out.push_str(&sq_name(sq)),
+            None => s.push('-'),
+            Some(sq) => s.push_str(&sq_name(sq)),
         }
-        out.push_str(&format!(" {} {}", self.half, self.full));
-        out
+        s.push_str(&format!(" {} {}", self.half, self.full));
+        s
     }
 
     fn compute_hash(&self) -> u64 {
@@ -450,7 +446,7 @@ impl Board {
         undo.captured_sq = captured_sq;
         undo.captured = self.piece_at(captured_sq);
         if is_ep_capture {
-            debug_assert!(undo.captured.map_or(false, |p| p.pt == PieceType::Pawn));
+            debug_assert!(undo.captured.is_some_and(|p| p.pt == PieceType::Pawn));
         }
 
         // Reset EP; set later if double push.
@@ -811,9 +807,9 @@ mod tests {
         let phantom1 = Move::from_uci("c7d6").unwrap();
         let phantom2 = Move::from_uci("e7d6").unwrap();
         let quiet_push = Move::from_uci("d7d6").unwrap();
-        assert!(!generate_pseudo(&mut b).contains(&phantom1));
-        assert!(!generate_pseudo(&mut b).contains(&phantom2));
-        assert!(generate_pseudo(&mut b).contains(&quiet_push));
+        assert!(!generate_pseudo(&b).contains(&phantom1));
+        assert!(!generate_pseudo(&b).contains(&phantom2));
+        assert!(generate_pseudo(&b).contains(&quiet_push));
         assert!(!generate_legal(&mut b).contains(&phantom1));
         assert!(!generate_legal(&mut b).contains(&phantom2));
         assert_eq!(b.to_fen(), fen0, "legality filtering mutated the board");
@@ -835,7 +831,7 @@ mod tests {
         // present): e5xd6 removes the d5 pawn.
         let mut e = Board::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").unwrap();
         let ep_mv = Move::from_uci("e5d6").unwrap();
-        assert!(generate_pseudo(&mut e).contains(&ep_mv));
+        assert!(generate_pseudo(&e).contains(&ep_mv));
         let efen = e.to_fen();
         let u = play(&mut e, "e5d6");
         assert_eq!(e.to_fen(), "4k3/8/3P4/8/8/8/8/4K3 b - - 0 1");

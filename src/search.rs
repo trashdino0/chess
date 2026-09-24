@@ -166,7 +166,7 @@ pub struct TT {
 
 impl TT {
     pub fn new(mb: usize) -> TT {
-        let bytes = (mb.max(1).min(1024) * 1024 * 1024) as u64;
+        let bytes = (mb.clamp(1, 1024) * 1024 * 1024) as u64;
         // 24-byte slots; round slot count down to a power of two.
         let mut n = (bytes / 24).max(1024);
         n = n.next_power_of_two() >> 1;
@@ -513,15 +513,17 @@ impl Searcher {
         order_moves(
             board,
             &mut root_moves,
-            None,
-            None,
-            None,
-            0,
-            &self.killers,
-            &self.history,
-            &self.counter,
-            &self.counter_hist,
-            &self.follow_hist,
+            &OrderCtx {
+                hash_move: None,
+                prev: None,
+                own_prev: None,
+                ply: 0,
+                killers: &self.killers,
+                history: &self.history,
+                counter: &self.counter,
+                counter_hist: &self.counter_hist,
+                follow_hist: &self.follow_hist,
+            },
         );
 
         let mut best = root_moves[0];
@@ -793,15 +795,17 @@ impl Searcher {
         order_moves(
             board,
             &mut moves,
-            hash_move,
-            prev,
-            own_prev,
-            ply,
-            &self.killers,
-            &self.history,
-            &self.counter,
-            &self.counter_hist,
-            &self.follow_hist,
+            &OrderCtx {
+                hash_move,
+                prev,
+                own_prev,
+                ply,
+                killers: &self.killers,
+                history: &self.history,
+                counter: &self.counter,
+                counter_hist: &self.counter_hist,
+                follow_hist: &self.follow_hist,
+            },
         );
 
         let mut best_move = None;
@@ -823,10 +827,14 @@ impl Searcher {
             let is_killer = Some(mv) == killer1 || Some(mv) == killer2;
             // Late-move pruning: skip very late quiets near the leaves.
             // Index 0 is always searched, so best_move is always set.
-            if !is_cap && !is_killer && !in_check && depth <= 2 && best_score > -MATE_BOUND {
-                if i >= 6 + depth as usize * 6 {
-                    continue;
-                }
+            if !is_cap
+                && !is_killer
+                && !in_check
+                && depth <= 2
+                && best_score > -MATE_BOUND
+                && i >= 6 + depth as usize * 6
+            {
+                continue;
             }
             self.stack[ply] = Some(mv);
             let undo = board.make_move(mv);
@@ -963,15 +971,17 @@ impl Searcher {
         order_moves(
             board,
             &mut ordered,
-            None,
-            prev,
-            own_prev,
-            ply,
-            &self.killers,
-            &self.history,
-            &self.counter,
-            &self.counter_hist,
-            &self.follow_hist,
+            &OrderCtx {
+                hash_move: None,
+                prev,
+                own_prev,
+                ply,
+                killers: &self.killers,
+                history: &self.history,
+                counter: &self.counter,
+                counter_hist: &self.counter_hist,
+                follow_hist: &self.follow_hist,
+            },
         );
 
         for mv in ordered {
@@ -1027,22 +1037,18 @@ impl Searcher {
         *h = (*h + depth * depth).min(1_000_000);
         // Countermove: reply `mv` to the move that led here, plus
         // counter-history for the enemy landing square.
-        if ply >= 1 {
-            if let Some(pm) = self.stack[ply - 1] {
-                self.counter[pm.from as usize][pm.to as usize] = Some(mv);
-                let c = &mut self.counter_hist[side.idx()][pm.to as usize][mv.from as usize]
-                    [mv.to as usize];
-                *c = (*c + depth * depth).min(1_000_000);
-            }
+        if ply >= 1 && let Some(pm) = self.stack[ply - 1] {
+            self.counter[pm.from as usize][pm.to as usize] = Some(mv);
+            let c = &mut self.counter_hist[side.idx()][pm.to as usize][mv.from as usize]
+                [mv.to as usize];
+            *c = (*c + depth * depth).min(1_000_000);
         }
         // Follow-up history: `mv` follows our own previous play two plies
         // back (same side to move then as now).
-        if ply >= 2 {
-            if let Some(op) = self.stack[ply - 2] {
-                let f = &mut self.follow_hist[side.idx()][op.to as usize][mv.from as usize]
-                    [mv.to as usize];
-                *f = (*f + depth * depth).min(1_000_000);
-            }
+        if ply >= 2 && let Some(op) = self.stack[ply - 2] {
+            let f = &mut self.follow_hist[side.idx()][op.to as usize][mv.from as usize]
+                [mv.to as usize];
+            *f = (*f + depth * depth).min(1_000_000);
         }
     }
 
@@ -1168,27 +1174,32 @@ fn has_non_pawn_material(board: &Board) -> bool {
         != 0
 }
 
-fn order_moves(
-    board: &Board,
-    moves: &mut [Move],
+/// Shared ordering context: the two stack moves that index the
+/// reply/follow-up histories plus every table. Bundled so `order_moves`
+/// takes three arguments instead of eleven.
+struct OrderCtx<'a> {
     hash_move: Option<Move>,
     prev: Option<Move>,
     own_prev: Option<Move>,
     ply: usize,
-    killers: &[[Option<Move>; 2]; MAX_PLY + 8],
-    history: &[[[i32; 64]; 64]; 2],
-    counter: &[[Option<Move>; 64]; 64],
-    counter_hist: &[[[[i32; 64]; 64]; 64]; 2],
-    follow_hist: &[[[[i32; 64]; 64]; 64]; 2],
-) {
+    killers: &'a [[Option<Move>; 2]; MAX_PLY + 8],
+    history: &'a [[[i32; 64]; 64]; 2],
+    counter: &'a [[Option<Move>; 64]; 64],
+    counter_hist: &'a [[[[i32; 64]; 64]; 64]; 2],
+    follow_hist: &'a [[[[i32; 64]; 64]; 64]; 2],
+}
+
+fn order_moves(board: &Board, moves: &mut [Move], ctx: &OrderCtx) {
     let side = board.side;
     // Countermove for the move that led here (quiet replies only).
-    let counter_move = prev.and_then(|pm| counter[pm.from as usize][pm.to as usize]);
+    let counter_move = ctx
+        .prev
+        .and_then(|pm| ctx.counter[pm.from as usize][pm.to as usize]);
     let mut scores: Vec<(i32, Move)> = moves
         .iter()
         .map(|&mv| {
             let mut s = 0i32;
-            if Some(mv) == hash_move {
+            if Some(mv) == ctx.hash_move {
                 s = 10_000_000;
             } else if let Some(promo) = mv.promotion {
                 s = 900_000 + promo.value();
@@ -1218,21 +1229,21 @@ fn order_moves(
                 // history (good from/to regardless of context), counter-
                 // history (good reply to the enemy's landing square) and
                 // follow-up history (good follow to our own previous play).
-                if ply < killers.len() {
-                    if killers[ply][0] == Some(mv) {
+                if ctx.ply < ctx.killers.len() {
+                    if ctx.killers[ctx.ply][0] == Some(mv) {
                         s = 800_000;
-                    } else if killers[ply][1] == Some(mv) {
+                    } else if ctx.killers[ctx.ply][1] == Some(mv) {
                         s = 790_000;
                     } else if counter_move == Some(mv) {
                         s = 785_000;
                     } else {
-                        s = history[side.idx()][mv.from as usize][mv.to as usize];
-                        if let Some(pm) = prev {
-                            s += counter_hist[side.idx()][pm.to as usize][mv.from as usize]
+                        s = ctx.history[side.idx()][mv.from as usize][mv.to as usize];
+                        if let Some(pm) = ctx.prev {
+                            s += ctx.counter_hist[side.idx()][pm.to as usize][mv.from as usize]
                                 [mv.to as usize];
                         }
-                        if let Some(op) = own_prev {
-                            s += follow_hist[side.idx()][op.to as usize][mv.from as usize]
+                        if let Some(op) = ctx.own_prev {
+                            s += ctx.follow_hist[side.idx()][op.to as usize][mv.from as usize]
                                 [mv.to as usize];
                         }
                     }
@@ -1241,7 +1252,7 @@ fn order_moves(
             (s, mv)
         })
         .collect();
-    scores.sort_by(|a, b| b.0.cmp(&a.0));
+    scores.sort_by_key(|&(s, _)| std::cmp::Reverse(s));
     for (i, (_, mv)) in scores.into_iter().enumerate() {
         moves[i] = mv;
     }
@@ -1437,11 +1448,19 @@ mod tests {
         let history = [[[0i32; 64]; 64]; 2];
         let counter = [[None; 64]; 64];
         let no_ch = zero_hist();
+        let ctx = OrderCtx {
+            hash_move: None,
+            prev: None,
+            own_prev: None,
+            ply: 0,
+            killers: &killers,
+            history: &history,
+            counter: &counter,
+            counter_hist: &no_ch,
+            follow_hist: &no_ch,
+        };
         let mut moves = vec![capture, killer];
-        order_moves(
-            &mut board, &mut moves, None, None, None, 0, &killers, &history, &counter, &no_ch,
-            &no_ch,
-        );
+        order_moves(&board, &mut moves, &ctx);
         assert_eq!(moves[0], killer, "losing capture must sort below killer");
 
         // Same board without the a6 defender: Qxb5 wins (+100) and outranks.
@@ -1451,19 +1470,7 @@ mod tests {
             .find(|m| m.from == 24 && m.to == 33)
             .expect("Qxb5 must be legal");
         let mut moves2 = vec![killer, capture2];
-        order_moves(
-            &mut board2,
-            &mut moves2,
-            None,
-            None,
-            None,
-            0,
-            &killers,
-            &history,
-            &counter,
-            &no_ch,
-            &no_ch,
-        );
+        order_moves(&board2, &mut moves2, &ctx);
         assert_eq!(moves2[0], capture2, "winning capture must sort first");
     }
 
@@ -1508,17 +1515,19 @@ mod tests {
         let mut moves = vec![plain, reply];
         board = Board::new_startpos();
         order_moves(
-            &mut board,
+            &board,
             &mut moves,
-            None,
-            Some(prev),
-            None,
-            1,
-            &killers,
-            &hist,
-            &counter,
-            &ch,
-            &no_fh,
+            &OrderCtx {
+                hash_move: None,
+                prev: Some(prev),
+                own_prev: None,
+                ply: 1,
+                killers: &killers,
+                history: &hist,
+                counter: &counter,
+                counter_hist: &ch,
+                follow_hist: &no_fh,
+            },
         );
         assert_eq!(
             moves[0], reply,

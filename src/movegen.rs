@@ -87,7 +87,7 @@ fn gen_pawn(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) {
     let ei = side.opposite().idx();
     let one_r = r + dir;
     // Single + double push.
-    if one_r >= 0 && one_r < 8 {
+    if (0..8).contains(&one_r) {
         let one = make_sq(f as u8, one_r as u8);
         if board.occ_all & bit(one) == 0 {
             push_pawn_move(moves, sq, one, one_r == promo_rank_next);
@@ -104,7 +104,7 @@ fn gen_pawn(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) {
     for df in [-1i8, 1i8] {
         let nf = f + df;
         let nr = r + dir;
-        if nf < 0 || nf >= 8 || nr < 0 || nr >= 8 {
+        if !(0..8).contains(&nf) || !(0..8).contains(&nr) {
             continue;
         }
         let to = make_sq(nf as u8, nr as u8);
@@ -189,7 +189,7 @@ fn gen_pawn_captures(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) 
     let ei = side.opposite().idx();
     let one_r = r + dir;
     // Quiet promotion push (no capture) is still a "capture" for quiescence.
-    if one_r >= 0 && one_r < 8 {
+    if (0..8).contains(&one_r) {
         let one = make_sq(f as u8, one_r as u8);
         if board.occ_all & bit(one) == 0 && one_r == promo_rank_next {
             push_pawn_move(moves, sq, one, true);
@@ -199,7 +199,7 @@ fn gen_pawn_captures(board: &Board, sq: u8, side: Color, moves: &mut Vec<Move>) 
     for df in [-1i8, 1i8] {
         let nf = f + df;
         let nr = r + dir;
-        if nf < 0 || nf >= 8 || nr < 0 || nr >= 8 {
+        if !(0..8).contains(&nf) || !(0..8).contains(&nr) {
             continue;
         }
         let to = make_sq(nf as u8, nr as u8);
@@ -384,8 +384,8 @@ pub fn see(board: &Board, mv: Move) -> i32 {
     occ ^= bit(from);
     if is_ep {
         let behind = if stm == Color::White { to - 8 } else { to + 8 };
-        for t in 0..6 {
-            bb[stm.opposite().idx()][t] &= !bit(behind);
+        for b in bb[stm.opposite().idx()].iter_mut() {
+            *b &= !bit(behind);
         }
         occ ^= bit(behind);
     } else if let Some(v) = target {
@@ -441,7 +441,7 @@ pub fn see(board: &Board, mv: Move) -> i32 {
     let mut i = n - 1;
     while i > 0 {
         i -= 1;
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             best = nets[i].min(best);
         } else {
             best = nets[i].max(best);

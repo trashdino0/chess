@@ -454,16 +454,29 @@ const PASSER_KING_W: i32 = 6;
 /// passed as per-file rank bitmasks (`1 << rank`), one entry per file.
 /// Passed pawns also score king distance to the promotion square (own king
 /// close / enemy king far is good), scaled up in the endgame via `phase`.
-fn pawn_structure(
+/// Inputs bundled so the signature stays readable.
+struct PawnCtx<'a> {
     color: Color,
     r: usize,
     f: usize,
-    own: &[u8; 8],
-    enemy: &[u8; 8],
+    own: &'a [u8; 8],
+    enemy: &'a [u8; 8],
     own_king: Option<u8>,
     enemy_king: Option<u8>,
     phase: i32,
-) -> i32 {
+}
+
+fn pawn_structure(ctx: &PawnCtx) -> i32 {
+    let PawnCtx {
+        color,
+        r,
+        f,
+        own,
+        enemy,
+        own_king,
+        enemy_king,
+        phase,
+    } = *ctx;
     let mut s = 0;
     // Doubled: more than one friendly pawn on this file.
     if own[f].count_ones() > 1 {
@@ -494,13 +507,7 @@ fn pawn_structure(
     };
     let lo = f.saturating_sub(1);
     let hi = (f + 1).min(7);
-    let mut blocked = false;
-    for nf in lo..=hi {
-        if enemy[nf] & ahead != 0 {
-            blocked = true;
-            break;
-        }
-    }
+    let blocked = (lo..=hi).any(|nf| enemy[nf] & ahead != 0);
     if !blocked {
         let rank_idx = match color {
             Color::White => r,
@@ -638,7 +645,16 @@ pub fn evaluate(board: &Board) -> i32 {
                             Color::White => (&white_pawns, &black_pawns, white_king, black_king),
                             Color::Black => (&black_pawns, &white_pawns, black_king, white_king),
                         };
-                        u += pawn_structure(color, r, f, own, enemy, ok, ek, phase);
+                        u += pawn_structure(&PawnCtx {
+                            color,
+                            r,
+                            f,
+                            own,
+                            enemy,
+                            own_king: ok,
+                            enemy_king: ek,
+                            phase,
+                        });
                     }
                     PieceType::Rook => {
                         let (own, enemy) = match color {
@@ -812,32 +828,29 @@ mod tests {
         // -12 + passed 35 + distance (1 - 6) x 6 x 24/24 = -30  =>  -7.
         let own = [0u8, 0, 0, 0, 1 << 4, 0, 0, 0];
         let enemy = [0u8; 8];
-        assert_eq!(
-            pawn_structure(Color::White, 4, 4, &own, &enemy, Some(12), Some(52), 0),
-            -7
-        );
+        let ps = |own_king, enemy_king, phase: i32, enemy: &[u8; 8]| {
+            pawn_structure(&PawnCtx {
+                color: Color::White,
+                r: 4,
+                f: 4,
+                own: &own,
+                enemy,
+                own_king,
+                enemy_king,
+                phase,
+            })
+        };
+        assert_eq!(ps(Some(12), Some(52), 0, &enemy), -7);
         // Defender on a6 instead (distance 4): (4 - 6) x 6 = -12  =>  11.
-        assert_eq!(
-            pawn_structure(Color::White, 4, 4, &own, &enemy, Some(12), Some(40), 0),
-            11
-        );
+        assert_eq!(ps(Some(12), Some(40), 0, &enemy), 11);
         // Full middlegame: distance term fades to 0  =>  -12 + 35 = 23.
-        assert_eq!(
-            pawn_structure(Color::White, 4, 4, &own, &enemy, Some(12), Some(52), 24),
-            23
-        );
+        assert_eq!(ps(Some(12), Some(52), 24, &enemy), 23);
         // Missing king: term skipped  =>  23.
-        assert_eq!(
-            pawn_structure(Color::White, 4, 4, &own, &enemy, None, Some(52), 0),
-            23
-        );
+        assert_eq!(ps(None, Some(52), 0, &enemy), 23);
         // Blocked pawn: no passer bonus and no distance term (still
         // isolated: -12).
         let enemy_pawn = [0u8, 0, 0, 0, 1 << 5, 0, 0, 0];
-        assert_eq!(
-            pawn_structure(Color::White, 4, 4, &own, &enemy_pawn, Some(12), Some(52), 0),
-            -12
-        );
+        assert_eq!(ps(Some(12), Some(52), 0, &enemy_pawn), -12);
     }
 
     #[test]
