@@ -55,7 +55,7 @@ Mate scores ply-adjusted (store +, probe −); root stores every iteration
 | `cargo test` | 49 passed |
 | `perft 4` startpos | 197281 (~25ms release) |
 | Kiwipete d3 / pos3 / endgame | 97862 / exact / exact (see tests) |
-| `bench 8` | 823,390 nodes, ~545–570k nps (±8% run noise) |
+| `bench 8` | 823,390 nodes, ~575k nps (±8% run noise) |
 | Gates | tapered kept; gravity 32–19–9 (+76 ±92); 200-game attempt exposed EP bug; TT aging neutral (52–48); SEE kept (23–21–16 @40/10, depth-12 Ba6>dxe6 proof); ring-attack kept (96–104 @40/10 neutral, Dragon sensed + Kirin f6 fixed); counter/follow-history kept (97.5–102.5 @40/10 neutral, −4.6% bench nodes, zero anomalies) |
 
 ## Test inventory (48)

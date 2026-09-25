@@ -60,10 +60,15 @@ fullmove number, and the Zobrist hash.
 **Zobrist hashing** identifies positions for repetition detection and the TT.
 Each (piece, square), castling-rights, and EP-file combination owns a random
 64-bit key from a deterministic `splitmix64` stream (seed `0x243F6A8885A308D3`,
-so every build hashes identically). A position's hash is those keys XORed
-together. Note: `make_move` currently **recomputes** the hash from scratch
-(`compute_hash`) rather than updating it incrementally — simple, and a known
-future speedup (see `plan.md`).
+so every build hashes identically). `make_move`/`make_null` update the hash
+**incrementally** (toggle mover, victim, castling-rook, rights, EP-file and
+side keys — O(1) instead of re-XORing all ~32 pieces); two subtleties live
+here: EP keys are per-*file*, so a same-file EP replacement toggles only on
+difference (removing + re-adding would cancel to zero), and a hand-fed
+phantom EP can "capture" the mover's own origin (victim toggle skipped when
+`captured_sq == from`). A `debug_assert` cross-checks every make against a
+from-scratch recompute in dev/test builds — that assert once caught a
+same-file EP bug red-handed before it poisoned a single search.
 
 **Undo** (`Undo` struct) snapshots `move`, `captured` (+ its square),
 castling rights, EP, halfmove clock, and hash before each move, so
@@ -302,8 +307,7 @@ sessions interactively or via GUI.
 
 ## 7. Known limitations (see `plan.md` for the fix list)
 
-Zero crates by design (no SIMD, no NNUE-style eval); full recompute of the
-Zobrist hash per make; `generate_legal` allocates a vector per node; no
+Zero crates by design (no SIMD, no NNUE-style eval); `generate_legal` allocates a vector per node; no
 opening book or tablebases in-engine
 (the lichess bridge can supply books externally); time margins are thin for
 bullet; `openings.epd` contains one synthetic illegal-ish French line with a

@@ -464,6 +464,8 @@ impl Board {
         self.pieces[si][placed_pt.idx()] |= bit(mv.to);
 
         // Castling: king moved two squares -> move the rook bits.
+        // Record the rook relocation for the incremental hash below.
+        let mut rook_move = None;
         if mover.pt == PieceType::King && (file_of(mv.from) as i8 - file_of(mv.to) as i8).abs() == 2
         {
             let (rf, rt) = match mv.to {
@@ -477,6 +479,7 @@ impl Board {
                 let ri = PieceType::Rook.idx();
                 self.pieces[si][ri] &= !bit(rf);
                 self.pieces[si][ri] |= bit(rt);
+                rook_move = Some((rf, rt));
             }
         }
         self.refresh_occupancy();
@@ -508,7 +511,53 @@ impl Board {
         }
         self.side = side.opposite();
 
-        self.hash = self.compute_hash();
+        // Incremental Zobrist: toggle exactly what changed instead of
+        // re-XORing all ~32 pieces (O(1) vs O(pieces) per make). Values are
+        // identical to compute_hash by construction — XOR order is
+        // irrelevant, and stale EP squares round-trip because old/new keys
+        // come from the recorded `undo.ep` / final `self.ep` respectively.
+        // The debug_assert cross-checks every make in dev/test builds
+        // (perft suites alone verify millions of positions); release pays
+        // only the handful of XORs.
+        let t = tables();
+        let mut h = self.hash;
+        // EP files share one key per file (not per square), so a move that
+        // replaces one EP square with another on the SAME file (e.g. pawn
+        // d7d6 while a stale d6 lingers) must toggle only on difference:
+        // removing and re-adding the same key would cancel to zero while
+        // the recompute holds it exactly once.
+        let old_ep = undo.ep.map(|ep| file_of(ep) as usize);
+        let new_ep = self.ep.map(|ep| file_of(ep) as usize);
+        if old_ep != new_ep {
+            if let Some(f) = old_ep {
+                h ^= t.ep_file[f];
+            }
+            if let Some(f) = new_ep {
+                h ^= t.ep_file[f];
+            }
+        }
+        h ^= t.castling[undo.castling as usize];
+        h ^= t.pieces[si][mover.pt.idx()][mv.from as usize];
+        h ^= t.pieces[si][placed_pt.idx()][mv.to as usize];
+        if let Some(cap) = undo.captured {
+            // A hand-fed phantom EP can "capture" the mover's own origin
+            // square (victim key == mover key); toggling twice would cancel
+            // while the recompute holds it zero times (d7 vacated). Skip
+            // the victim toggle then — generated moves never hit this
+            // (EP victims sit beside `to`, never on `from`).
+            if captured_sq != mv.from {
+                h ^= t.pieces[cap.color.idx()][cap.pt.idx()][captured_sq as usize];
+            }
+        }
+        if let Some((rf, rt)) = rook_move {
+            let ri = PieceType::Rook.idx();
+            h ^= t.pieces[si][ri][rf as usize];
+            h ^= t.pieces[si][ri][rt as usize];
+        }
+        h ^= t.castling[self.castling as usize];
+        h ^= t.side;
+        self.hash = h;
+        debug_assert_eq!(self.hash, self.compute_hash());
         self.hash_history.push(self.hash);
         *self.hash_counts.entry(self.hash).or_insert(0) += 1;
         undo
@@ -595,7 +644,17 @@ impl Board {
             self.full += 1;
         }
         self.side = self.side.opposite();
-        self.hash = self.compute_hash();
+        // Incremental Zobrist (same scheme as make_move): drop the old EP
+        // key (a null move always clears EP) and flip the side key.
+        // Castling rights never change under a null move, so no-op there.
+        let t = tables();
+        let mut h = self.hash;
+        if let Some(ep) = undo.ep {
+            h ^= t.ep_file[file_of(ep) as usize];
+        }
+        h ^= t.side;
+        self.hash = h;
+        debug_assert_eq!(self.hash, self.compute_hash());
         self.hash_history.push(self.hash);
         *self.hash_counts.entry(self.hash).or_insert(0) += 1;
         undo
@@ -718,6 +777,68 @@ mod tests {
     fn play(b: &mut Board, uci: &str) -> Undo {
         let mv = Move::from_uci(uci).unwrap();
         b.make_move(mv)
+    }
+
+    #[test]
+    fn incremental_hash_matches_full_recompute() {
+        // P8: tricky sequence — double push (sets EP), EP-adjacent play,
+        // capture, promotion, castling (moves the rook), null move. After
+        // every step the incremental hash must equal a from-scratch
+        // recompute; unmakes restore by construction (undo.hash).
+        let mut b =
+            Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1")
+                .unwrap();
+        assert_eq!(b.hash, b.compute_hash());
+        // a2a4 double push sets an EP square (hash must include it).
+        let u1 = play(&mut b, "a2a4");
+        assert_eq!(b.hash, b.compute_hash());
+        assert_eq!(b.ep, Move::from_uci("a2a3").map(|m| m.to));
+        // ...c7c5 replies with its own double push (old EP out, new in).
+        let u2 = play(&mut b, "c7c5");
+        assert_eq!(b.hash, b.compute_hash());
+        assert_eq!(b.ep, Move::from_uci("c7c6").map(|m| m.to));
+        // Same-file EP replacement: stale d6 lingers while d7d6 is played
+        // (EP keys are per-file, so remove+add of file d must NOT cancel).
+        let mut s =
+            Board::from_fen("r1bqkbnr/pppp1ppp/2n5/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R b KQkq d6 0 1")
+                .unwrap();
+        let us = play(&mut s, "d7d6");
+        assert_eq!(s.hash, s.compute_hash());
+        assert_eq!(s.ep, None);
+        s.unmake_move(us);
+        assert_eq!(s.hash, s.compute_hash());
+        // Capture on e4-side tension square if available, else any capture.
+        use crate::movegen::generate_legal;
+        if let Some(cap) = generate_legal(&mut b)
+            .into_iter()
+            .find(|m| b.piece_at(m.to).is_some())
+        {
+            let _u = b.make_move(cap);
+            assert_eq!(b.hash, b.compute_hash());
+            b.unmake_move(_u);
+            assert_eq!(b.hash, b.compute_hash());
+        }
+        // Promotion race position: white pawn one step from queening.
+        let mut p = Board::from_fen("4k3/2P5/8/8/8/8/1K6/8 w - - 0 1").unwrap();
+        let up = play(&mut p, "c7c8q");
+        assert_eq!(p.hash, p.compute_hash());
+        p.unmake_move(up);
+        assert_eq!(p.hash, p.compute_hash());
+        // Kingside castle moves king + rook and drops both rights.
+        let mut c = Board::from_fen("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1").unwrap();
+        let uc = play(&mut c, "e1g1");
+        assert_eq!(c.hash, c.compute_hash());
+        c.unmake_move(uc);
+        assert_eq!(c.hash, c.compute_hash());
+        // Null move flips side + clears EP.
+        let un = b.make_null();
+        assert_eq!(b.hash, b.compute_hash());
+        b.unmake_null(un);
+        assert_eq!(b.hash, b.compute_hash());
+        // Unwind the whole line: exact restoration.
+        b.unmake_move(u2);
+        b.unmake_move(u1);
+        assert_eq!(b.hash, b.compute_hash());
     }
 
     #[test]
