@@ -15,7 +15,10 @@ use crate::movegen::{generate_legal, perft};
 use crate::search::{search_root, Limits, TT};
 use crate::types::Move;
 
-pub const ENGINE_NAME: &str = "Ferrum 2.0";
+/// Advertised in the `uci` handshake so bot logs self-identify the binary.
+/// Version comes from `Cargo.toml` (bumped per gated improvement); the
+/// generation name stays human-readable. `env!` keeps this std-only.
+pub const ENGINE_NAME: &str = concat!("Ferrum 2.0 (", env!("CARGO_PKG_VERSION"), ")");
 pub const ENGINE_AUTHOR: &str = "opencode";
 
 pub struct Engine {
