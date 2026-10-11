@@ -267,6 +267,8 @@ impl Board {
 
     /// Test helper: occupancy matches the piece boards, and no square is on
     /// two piece boards at once.
+    /// (The make/unmake cross-checks below inline the fold instead: a
+    /// #[cfg(test)] helper is unresolvable inside release `debug_assert!`.)
     #[cfg(test)]
     fn check_occ(&self) {
         let mut all = 0u64;
@@ -482,7 +484,47 @@ impl Board {
                 rook_move = Some((rf, rt));
             }
         }
-        self.refresh_occupancy();
+        // Incremental occupancy: toggle exactly the squares that changed
+        // instead of re-folding all 12 piece bitboards (O(1) vs O(pieces)
+        // per make — same P8.1 pattern as the Zobrist hash, identical values
+        // by construction). Victim traps mirror the hash: a phantom
+        // self-capture (captured_sq == from, e.g. a push onto a stale EP
+        // square) must skip the victim toggle or it re-sets the vacated
+        // square, and the combined board only gains the jumped square when
+        // it differs from both `from` and `to` (normal captures land ON the
+        // victim: no extra bit). The debug_assert cross-checks every make
+        // in dev/test builds; perft suites exercise millions of positions.
+        self.occ[si] ^= bit(mv.from) ^ bit(mv.to);
+        if let Some(cap) = undo.captured && captured_sq != mv.from {
+            self.occ[cap.color.idx()] ^= bit(captured_sq);
+        }
+        // Combined board: `from` always vacates. `to` gains the mover
+        // except on a normal capture (victim-out + mover-in cancel on the
+        // same square); the EP jumped square vacates when it differs.
+        self.occ_all ^= bit(mv.from);
+        match undo.captured {
+            None => self.occ_all ^= bit(mv.to),
+            Some(_) if captured_sq == mv.to => {}
+            Some(_) => {
+                self.occ_all ^= bit(mv.to);
+                if captured_sq != mv.from {
+                    self.occ_all ^= bit(captured_sq);
+                }
+            }
+        }
+        if let Some((rf, rt)) = rook_move {
+            self.occ[si] ^= bit(rf) ^ bit(rt);
+            self.occ_all ^= bit(rf) ^ bit(rt);
+        }
+        debug_assert_eq!(
+            self.occ[0],
+            self.pieces[0].iter().fold(0u64, |a, bb| a | bb)
+        );
+        debug_assert_eq!(
+            self.occ[1],
+            self.pieces[1].iter().fold(0u64, |a, bb| a | bb)
+        );
+        debug_assert_eq!(self.occ_all, self.occ[0] | self.occ[1]);
 
         // Pawn double push -> set EP square.
         if mover.pt == PieceType::Pawn && (rank_of(mv.from) as i8 - rank_of(mv.to) as i8).abs() == 2
@@ -623,7 +665,48 @@ impl Board {
                 mover.pt
             };
             self.pieces[si][orig_pt.idx()] |= bit(mv.from);
-            self.refresh_occupancy();
+            // Incremental occupancy: XOR is self-inverse, so unmake applies
+            // the same toggles as make (same trap guards). Castling rook
+            // relocation reversed in the same XOR form.
+            self.occ[si] ^= bit(mv.from) ^ bit(mv.to);
+            if let Some(cap) = undo.captured && undo.captured_sq != mv.from {
+                self.occ[cap.color.idx()] ^= bit(undo.captured_sq);
+            }
+            self.occ_all ^= bit(mv.from);
+            match undo.captured {
+                None => self.occ_all ^= bit(mv.to),
+                Some(_) if undo.captured_sq == mv.to => {}
+                Some(_) => {
+                    self.occ_all ^= bit(mv.to);
+                    if undo.captured_sq != mv.from {
+                        self.occ_all ^= bit(undo.captured_sq);
+                    }
+                }
+            }
+            if mover.pt == PieceType::King
+                && (file_of(mv.from) as i8 - file_of(mv.to) as i8).abs() == 2
+            {
+                let (rf, rt) = match mv.to {
+                    x if x == G1 => (H1, 5),
+                    x if x == C1 => (A1, 3),
+                    x if x == G8 => (H8, 61),
+                    x if x == C8 => (A8, 59),
+                    _ => (0, 0),
+                };
+                if rf != rt {
+                    self.occ[si] ^= bit(rf) ^ bit(rt);
+                    self.occ_all ^= bit(rf) ^ bit(rt);
+                }
+            }
+            debug_assert_eq!(
+                self.occ[0],
+                self.pieces[0].iter().fold(0u64, |a, bb| a | bb)
+            );
+            debug_assert_eq!(
+                self.occ[1],
+                self.pieces[1].iter().fold(0u64, |a, bb| a | bb)
+            );
+            debug_assert_eq!(self.occ_all, self.occ[0] | self.occ[1]);
         }
     }
 
