@@ -12,11 +12,11 @@ Requires `cargo` (Windows PowerShell 5.1; prefix if not on `PATH`):
 ```powershell
 $env:Path = "$env:USERPROFILE\.cargo\bin;" + $env:Path
 cargo build --release   # GUI binary: target\release\dinochess.exe
-cargo test              # 53 tests: perft + eval + TT + make/unmake + dino
+cargo test              # 57 tests: perft + eval + TT + make/unmake + dino + CLI
 
 # CLI shortcuts (deterministic, single-threaded — preferred for testing):
-.\target\release\dinochess.exe perft 4
-.\target\release\dinochess.exe search 8 [fen]
+.\target\release\dinochess.exe perft 4 [fen] [moves ...]
+.\target\release\dinochess.exe search 8 [fen] [moves ...]
 .\target\release\dinochess.exe bench 8
 ```
 

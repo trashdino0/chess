@@ -18,8 +18,8 @@ after any search/eval change; HARD 0/4 is the upward headroom).
   Dev profile sets `opt-level = 1` so perft d4 stays fast; don't remove it.
 - `cargo build --release` — GUI binary: `target\release\dinochess.exe`.
 - CLI shortcuts bypass the UCI loop (preferred for testing):
-  `dinochess.exe perft <depth> [fen]`,
-  `dinochess.exe search <depth> [fen]`,
+  `dinochess.exe perft <depth> [fen] [moves ...]`,
+  `dinochess.exe search <depth> [fen] [moves ...]`,
   `dinochess.exe bench [depth]`.
 
 ## UCI testing gotcha

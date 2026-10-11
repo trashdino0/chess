@@ -54,14 +54,14 @@ Mate scores ply-adjusted (store +, probe −); root stores every iteration
 
 | Check | Expected |
 |---|---|
-| `cargo test` | 53 passed |
+| `cargo test` | 57 passed |
 | `perft 4` startpos | 197281 (~25ms release) |
 | Kiwipete d3 / pos3 / endgame | 97862 / exact / exact (see tests) |
 | `bench 8` | 823,390 nodes, ~575k nps (±8% run noise) |
-| `run-sts.ps1 depth 8` | 20/24 (MATE 5/5, TAC 5/5, AVD 4/4, ANC 6/6, HARD 0/4), ~2.5s, deterministic |
+| `run-sts.ps1 depth 8` | 20/25 (MATE 5/5, TAC 5/5, AVD 4/4, ANC 6/6, HARD 0/5), ~2.6s, deterministic |
 | Gates | tapered kept; gravity 32–19–9 (+76 ±92); 200-game attempt exposed EP bug; TT aging neutral (52–48); SEE kept (23–21–16 @40/10, depth-12 Ba6>dxe6 proof); ring-attack kept (96–104 @40/10 neutral, Dragon sensed + Kirin f6 fixed); counter/follow-history kept (97.5–102.5 @40/10 neutral, −4.6% bench nodes, zero anomalies) |
 
-## Test inventory (53)
+## Test inventory (57)
 
 perft: startpos d1–4, Kiwipete (+d4), pos3 deep, endgame, captures-vs-filter
 (+children) · eval: balance/symmetry (mirrored side), queen, passer

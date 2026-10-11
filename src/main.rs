@@ -16,11 +16,17 @@ fn main() {
         match args[1].as_str() {
             "perft" => {
                 let depth: u32 = args.get(2).and_then(|d| d.parse().ok()).unwrap_or(4);
-                let fen = args
+                let arg = args
                     .get(3)
                     .map(|s| s.as_str())
                     .unwrap_or(board::STARTPOS_FEN);
-                let mut b = board::Board::from_fen(fen).expect("bad FEN");
+                let mut b = match uci::board_from_cli_arg(arg) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("info string error: {e}");
+                        return;
+                    }
+                };
                 let t = std::time::Instant::now();
                 let n = movegen::perft(&mut b, depth);
                 println!("perft({depth}) = {n} in {:?}", t.elapsed());
@@ -32,7 +38,7 @@ fn main() {
                 return;
             }
             "search" => {
-                // dinochess search <depth> [fen] — direct search, no UCI loop.
+                // dinochess search <depth> [fen] [moves ...] — direct search, no UCI loop.
                 let depth: u8 = args.get(2).and_then(|d| d.parse().ok()).unwrap_or(5);
                 let fen = args
                     .get(3)

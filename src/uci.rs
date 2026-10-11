@@ -408,16 +408,65 @@ fn void_fen_check() {
     let _ = STARTPOS_FEN;
 }
 
+/// Parse a CLI position argument: `<FEN6> [moves m1 m2 ...]`, mirroring
+/// the UCI `position` command's semantics on a single argument string.
+/// Every move is validated against the legal set; the first illegal token
+/// (or a bad FEN) is an `Err`, never a silent drop or a panic.
+pub fn board_from_cli_arg(arg: &str) -> Result<Board, String> {
+    let toks: Vec<&str> = arg.split_whitespace().collect();
+    let moves_at = toks.iter().position(|&t| t == "moves");
+    // `startpos [moves ...]` mirrors the UCI `position` command.
+    if toks.first() == Some(&"startpos") {
+        let mut board = Board::new_startpos();
+        if let Some(i) = moves_at {
+            apply_cli_moves(&mut board, &toks[i + 1..])?;
+        } else if toks.len() > 1 {
+            return Err(format!("trailing tokens without `moves`: {arg}"));
+        }
+        return Ok(board);
+    }
+    let fen_end = moves_at.unwrap_or(toks.len());
+    if fen_end < 4 {
+        return Err(format!("need a FEN (got {fen_end} fields): {arg}"));
+    }
+    let mut board = Board::from_fen(&toks[..fen_end].join(" "))?;
+    if let Some(i) = moves_at {
+        apply_cli_moves(&mut board, &toks[i + 1..])?;
+    }
+    Ok(board)
+}
+
+/// Validate + play UCI move tokens (shared by the FEN and startpos paths).
+fn apply_cli_moves(board: &mut Board, moves: &[&str]) -> Result<(), String> {
+    for mstr in moves {
+        let mv = Move::from_uci(mstr).ok_or_else(|| format!("bad move token: {mstr}"))?;
+        if !generate_legal(board).contains(&mv) {
+            return Err(format!("illegal move: {mstr} in {}", board.to_fen()));
+        }
+        board.make_move(mv);
+    }
+    Ok(())
+}
+
 /// CLI entry for `bench [depth]` (bypasses the UCI loop).
 pub fn bench_cli(depth: u8) {
     let mut eng = Engine::new();
     run_bench(&mut eng, depth);
 }
 
-/// CLI entry for `search <depth> [fen]` (bypasses the UCI loop).
-pub fn search_cli(depth: u8, fen: &str) {
+/// CLI entry for `search <depth> [fen] [moves ...]` (bypasses the UCI loop).
+/// Unlike the lenient old path, a trailing `moves` section is applied
+/// (validated against legal moves) and a bad FEN/move prints an error
+/// instead of panicking — the silent `moves`-drop burned analysis time.
+pub fn search_cli(depth: u8, arg: &str) {
     let mut eng = Engine::new();
-    eng.board = Board::from_fen(fen).expect("bad FEN");
+    match board_from_cli_arg(arg) {
+        Ok(b) => eng.board = b,
+        Err(e) => {
+            println!("info string error: {e}");
+            return;
+        }
+    }
     let lim = Limits {
         depth: Some(depth),
         ..Default::default()
@@ -487,4 +536,61 @@ fn run_bench(eng: &mut Engine, depth: u8) {
 
 fn flush() {
     let _ = std::io::stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Color;
+
+    #[test]
+    fn cli_arg_plain_fen_round_trips() {
+        let b = board_from_cli_arg(crate::board::STARTPOS_FEN).unwrap();
+        assert_eq!(b.to_fen(), crate::board::STARTPOS_FEN);
+    }
+
+    #[test]
+    fn cli_arg_applies_moves_suffix() {
+        // Startpos + e2e4: black to move, pawn on e4, EP square set.
+        let b = board_from_cli_arg(&format!("{} moves e2e4", crate::board::STARTPOS_FEN))
+            .unwrap();
+        assert_eq!(b.side, Color::Black);
+        assert_eq!(
+            b.to_fen(),
+            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
+        );
+    }
+
+    #[test]
+    fn cli_arg_reaches_kirin_position() {
+        // P6/HARD.05 victim cross-check: the full KirinChessBot game line
+        // must reproduce the analyzed FEN exactly (guards the STS entry
+        // against a reconstruction typo — the 9-pawn kind).
+        let line = "g1f3 a7a6 e2e4 b7b5 d2d4 c8b7 b1d2 e7e6 a2a4 b5b4 f1d3 \
+            c7c5 d4d5 e6d5 e1g1 c5c4 e4d5 c4d3 f1e1 f8e7 d5d6 d3c2 d1c2 \
+            e8f8 d6e7 g8e7 d2e4 d7d5 c1g5 d5e4 a1d1 d8e8 c2c7";
+        let b = board_from_cli_arg(&format!("startpos moves {line}")).unwrap();
+        assert_eq!(
+            b.to_fen(),
+            "rn2qk1r/1bQ1nppp/p7/6B1/Pp2p3/5N2/1P3PPP/3RR1K1 b - - 3 17"
+        );
+    }
+
+    #[test]
+    fn cli_arg_rejects_bad_fen_and_moves() {
+        assert!(board_from_cli_arg("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP w KQkq -").is_err());
+        assert!(board_from_cli_arg("too short").is_err());
+        // Illegal token.
+        assert!(board_from_cli_arg(&format!(
+            "{} moves e2e5",
+            crate::board::STARTPOS_FEN
+        ))
+        .is_err());
+        // Well-formed but illegal in context (blocked queen).
+        assert!(board_from_cli_arg(&format!(
+            "{} moves d1h5",
+            crate::board::STARTPOS_FEN
+        ))
+        .is_err());
+    }
 }
