@@ -958,47 +958,77 @@ impl Searcher {
             return Ok(alpha);
         }
         let mut ordered = moves;
-        let prev = if ply > 0 && ply - 1 < self.stack.len() {
-            self.stack[ply - 1]
-        } else {
-            None
-        };
-        let own_prev = if ply >= 2 && ply - 2 < self.stack.len() {
-            self.stack[ply - 2]
-        } else {
-            None
-        };
-        order_moves(
-            board,
-            &mut ordered,
-            &OrderCtx {
-                hash_move: None,
-                prev,
-                own_prev,
-                ply,
-                killers: &self.killers,
-                history: &self.history,
-                counter: &self.counter,
-                counter_hist: &self.counter_hist,
-                follow_hist: &self.follow_hist,
-            },
-        );
+        if in_check {
+            let prev = if ply > 0 && ply - 1 < self.stack.len() {
+                self.stack[ply - 1]
+            } else {
+                None
+            };
+            let own_prev = if ply >= 2 && ply - 2 < self.stack.len() {
+                self.stack[ply - 2]
+            } else {
+                None
+            };
+            order_moves(
+                board,
+                &mut ordered,
+                &OrderCtx {
+                    hash_move: None,
+                    prev,
+                    own_prev,
+                    ply,
+                    killers: &self.killers,
+                    history: &self.history,
+                    counter: &self.counter,
+                    counter_hist: &self.counter_hist,
+                    follow_hist: &self.follow_hist,
+                },
+            );
 
-        for mv in ordered {
+            for mv in ordered {
+                if ply < self.stack.len() {
+                    self.stack[ply] = Some(mv);
+                }
+                let sc = self.qsearch_move(board, mv, alpha, beta, ply, poll)?;
+                if sc > alpha {
+                    alpha = sc;
+                }
+                if alpha >= beta {
+                    return Ok(beta);
+                }
+            }
+            return Ok(alpha);
+        }
+        // Captures/promotions only: SEE is computed once per capture and
+        // shared between ordering and delta pruning (the old code paid for
+        // it twice: inside `order_moves` and again at the delta check).
+        // Tier keys are exactly `order_moves`' for this move set (no hash
+        // move here; quiets unreachable by `generate_pseudo_captures`
+        // construction) — bench8 bit-identity proves no divergence.
+        let mut scored: Vec<(i32, Move, i32)> = ordered
+            .into_iter()
+            .map(|mv| {
+                let exchange = if mv.promotion.is_some() {
+                    0
+                } else {
+                    see(board, mv)
+                };
+                (qs_tier(board, mv, exchange), mv, exchange)
+            })
+            .collect();
+        scored.sort_by_key(|&(key, _, _)| std::cmp::Reverse(key));
+        for (_, mv, exchange) in scored {
             if ply < self.stack.len() {
                 self.stack[ply] = Some(mv);
             }
             // Delta pruning: even winning the full exchange can't recover
             // alpha (SEE + static, not victim + static — a hanging QxP is
-            // skipped, a PxQ sac is searched). Promotions and evasions never
-            // skip. All scores here are side-relative, matching alpha.
-            if !in_check && mv.promotion.is_none() && see(board, mv) + stand + 150 <= alpha {
+            // skipped, a PxQ sac is searched). Promotions never skip (their
+            // cached exchange is an unused 0). Scores are side-relative.
+            if mv.promotion.is_none() && exchange + stand + 150 <= alpha {
                 continue;
             }
-            let undo = board.make_move(mv);
-            let res = self.quiescence(board, -beta, -alpha, ply + 1, poll);
-            board.unmake_move(undo);
-            let sc = -res?;
+            let sc = self.qsearch_move(board, mv, alpha, beta, ply, poll)?;
             if sc > alpha {
                 alpha = sc;
             }
@@ -1007,6 +1037,24 @@ impl Searcher {
             }
         }
         Ok(alpha)
+    }
+
+    /// One quiescence move: make, recurse, unmake. Unmake runs before `?`
+    /// can propagate so aborts never dirty the board (same pattern as the
+    /// negamax call sites).
+    fn qsearch_move(
+        &mut self,
+        board: &mut Board,
+        mv: Move,
+        alpha: i32,
+        beta: i32,
+        ply: usize,
+        poll: &mut dyn FnMut() -> bool,
+    ) -> Result<i32, Abort> {
+        let undo = board.make_move(mv);
+        let res = self.quiescence(board, -beta, -alpha, ply + 1, poll);
+        board.unmake_move(undo);
+        Ok(-res?)
     }
 
     fn selduring(&mut self, ply: usize) {
@@ -1189,6 +1237,35 @@ struct OrderCtx<'a> {
     follow_hist: &'a [[[[i32; 64]; 64]; 64]; 2],
 }
 
+/// Quiescence tier key for one capture/promotion, given its cached SEE.
+/// Must stay exactly equal to what `order_moves` computes for the same
+/// move (hash move is always None in quiescence; quiets never occur in
+/// the !in_check capture set, so killer/counter/history tiers are
+/// unreachable — the `else` is a defensive 0). Any divergence changes
+/// search behavior and fails the bit-identical bench8 gate loudly.
+fn qs_tier(board: &Board, mv: Move, exchange: i32) -> i32 {
+    if let Some(promo) = mv.promotion {
+        let mut s = 900_000 + promo.value();
+        if let Some(victim) = board.piece_at(mv.to) {
+            s += victim.pt.value() * 10;
+        }
+        s
+    } else if board.piece_at(mv.to).is_some() || Some(mv.to) == board.ep {
+        if exchange >= 0 {
+            let victim = board
+                .piece_at(mv.to)
+                .map(|p| p.pt.value())
+                .unwrap_or(PieceType::Pawn.value());
+            let attacker = board.piece_at(mv.from).map(|p| p.pt.value()).unwrap_or(0);
+            1_000_000 + victim * 10 - attacker
+        } else {
+            700_000 + exchange
+        }
+    } else {
+        0
+    }
+}
+
 fn order_moves(board: &Board, moves: &mut [Move], ctx: &OrderCtx) {
     let side = board.side;
     // Countermove for the move that led here (quiet replies only).
@@ -1278,6 +1355,62 @@ mod tests {
             v.push(Some(Move::new(52, 60, Some(pt))));
         }
         v
+    }
+
+    #[test]
+    fn qs_order_matches_shared_ordering() {
+        // The quiescence fast path (cached SEE + qs_tier) must order
+        // captures/promotions exactly like order_moves: same keys, same
+        // stable sort, same input order. FENs cover EP, promotions
+        // (quiet + capture), losing captures, and a full middlegame.
+        let killers = [[None; 2]; MAX_PLY + 8];
+        let history = [[[0i32; 64]; 64]; 2];
+        let counter = [[None; 64]; 64];
+        let ch = zero_hist();
+        let fh = zero_hist();
+        let ctx = OrderCtx {
+            hash_move: None,
+            prev: None,
+            own_prev: None,
+            ply: 4,
+            killers: &killers,
+            history: &history,
+            counter: &counter,
+            counter_hist: &ch,
+            follow_hist: &fh,
+        };
+        for fen in [
+            crate::board::STARTPOS_FEN,
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R b KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "4k3/8/p7/1p6/Q7/8/8/4K3 w - - 0 1",
+            "4k3/8/8/3Pp3/4K3/8/8/8 w - e6 0 1",
+            "3r2k1/2P4p/8/8/8/8/5K2/8 w - - 0 1",
+            "8/2P2k2/8/8/8/8/5K2/8 w - - 0 1",
+        ] {
+            let mut board = crate::board::Board::from_fen(fen).unwrap();
+            if board.in_check(board.side) {
+                continue; // evasions keep the shared path; nothing to compare
+            }
+            let caps = crate::movegen::generate_captures(&mut board);
+            let mut shared = caps.clone();
+            order_moves(&board, &mut shared, &ctx);
+            let mut fast: Vec<(i32, Move, i32)> = caps
+                .into_iter()
+                .map(|mv| {
+                    let exchange = if mv.promotion.is_some() {
+                        0
+                    } else {
+                        see(&board, mv)
+                    };
+                    (qs_tier(&board, mv, exchange), mv, exchange)
+                })
+                .collect();
+            fast.sort_by_key(|&(key, _, _)| std::cmp::Reverse(key));
+            let fast_moves: Vec<Move> = fast.into_iter().map(|(_, mv, _)| mv).collect();
+            assert_eq!(shared, fast_moves, "order mismatch on {fen}");
+        }
     }
 
     #[test]
