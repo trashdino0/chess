@@ -3,6 +3,8 @@
 Rust UCI chess engine. Std-only (zero deps by design — don't add crates).
 `src/`: `types` → `board` → `movegen` → `eval` → `search` → `uci` → `main`
 (`bitboard` serves `board`/`movegen`; `dino` holds mascot facts for `uci`).
+`benchmarks/sts.epd` + `run-sts.ps1`: P6 STS harness (24 positions, rerun
+after any search/eval change; HARD 0/4 is the upward headroom).
 
 ## Toolchain (Windows PowerShell 5.1)
 

@@ -1,0 +1,34 @@
+# DinoChess STS suite (P6): 20 positions, 4 themes, fixed-depth verdicts.
+# Format per line: <FEN6> bm <uci> [uci...]; [am <uci> [...];] id THEME.nn;
+#   bm = acceptable best moves (any match solves; mate score also solves).
+#   am = blunders (solves iff bestmove not among them).
+# MATE positions are hand-verified mate-in-1 (see plan.md P6 log for the
+# verification discipline: FEN pawn-count legality + engine 0000-probe).
+# ANCHOR bm = depth-8 verdict on 2026-10-11 (regression tripwires, not truth).
+# HARD bm = depth-12 verdict where depth-8 disagrees (upward headroom: deeper
+# search is closer to truth; a future change that flips these to bm at depth
+# 8 scores without needing 200 games to notice).
+r1bqkbnr/pppp1ppp/2n5/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 1 1 bm h5f7; id MATE.01;
+6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1 bm a1a8; id MATE.02;
+rnbqkbnr/pppp1ppp/8/4p3/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq - 0 2 bm d8h4; id MATE.03;
+7k/8/5QK1/8/8/8/8/8 w - - 0 1 bm f6g7; id MATE.04;
+7k/6Q1/6K1/8/8/8/8/8 w - - 0 1 bm g6f6 g7h7; id MATE.05;
+4k3/8/8/1p6/Q7/8/8/4K3 w - - 0 1 bm a4b5; id TAC.01;
+4k3/8/8/3Pp3/4K3/8/8/8 w - e6 0 1 bm d5e6; id TAC.02;
+3r2k1/2P4p/8/8/8/8/5K2/8 w - - 0 1 bm c7d8q; id TAC.03;
+4k3/8/2b5/3n4/8/8/3R4/3QK3 w - - 0 1 bm d1h5 d2d5; id TAC.04;
+4k3/8/8/8/8/1B6/5rPP/4K3 w - - 0 1 bm e1f2; id TAC.05;
+4k3/8/p7/1p6/Q7/8/8/4K3 w - - 0 1 am a4b5; id AVD.01;
+r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 3 3 am c4f7; id AVD.02;
+rnbqkbnr/pppp1ppp/8/4p3/8/5P2/PPPPP1PP/RNBQKBNR w KQkq - 0 2 am g2g4; id AVD.03;
+k7/8/1Q6/8/8/8/8/K7 w - - 0 1 am b6c7; id AVD.04;
+rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 bm e2e3; id ANC.01;
+r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1 bm e2a6; id ANC.02;
+8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1 bm b4f4; id ANC.03;
+2kr3r/ppp1qppp/2n1pn2/3p4/3P1B2/2P1PN2/PPQ2PPP/R3K2R w KQ - 0 1 bm f3e5; id ANC.04;
+5rk1/pp3ppp/2p2n2/3p4/3P4/2P1PN2/PP3PPP/5RK1 w - - 0 1 bm f3e5; id ANC.05;
+r1bqkbnr/pppp1ppp/2n5/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 1 1 bm d8e7; id ANC.06;
+r1bqkb1r/pppp1ppp/2n2n2/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3 bm a7a6; id HARD.01;
+2kr3r/ppp1qppp/2n1pn2/3p4/3P1B2/2P1PN2/PPQ2PPP/R3K2R w KQ - 0 1 bm b2b4; id HARD.02;
+5rk1/pp3ppp/2p2n2/3p4/3P4/2P1PN2/PP3PPP/5RK1 w - - 0 1 bm c3c4; id HARD.03;
+8/5pk1/5p1p/8/8/1P3P1P/5PK1/8 w - - 0 1 bm b3b4; id HARD.04;
