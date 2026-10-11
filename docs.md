@@ -1,6 +1,6 @@
-# Ferrum — How It Works
+# DinoChess — How It Works
 
-Ferrum (`chess-engine`) is a classical chess engine in zero-dependency Rust:
+DinoChess (`dinochess`) is a classical chess engine in zero-dependency Rust:
 it picks moves by **searching** future positions with alpha-beta negamax and
 scoring them with a **hand-written evaluation**. No neural network, no opening
 book, no tablebases — just game-tree search plus chess knowledge encoded as

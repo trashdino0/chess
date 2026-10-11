@@ -16,9 +16,9 @@ use crate::search::{search_root, Limits, TT};
 use crate::types::Move;
 
 /// Advertised in the `uci` handshake so bot logs self-identify the binary.
-/// Version comes from `Cargo.toml` (bumped per gated improvement); the
-/// generation name stays human-readable. `env!` keeps this std-only.
-pub const ENGINE_NAME: &str = concat!("Ferrum 2.0 (", env!("CARGO_PKG_VERSION"), ")");
+/// Version comes from `Cargo.toml` (bumped per gated improvement, minor for
+/// the Ferrum -> DinoChess rename); `env!` keeps this std-only.
+pub const ENGINE_NAME: &str = concat!("DinoChess (", env!("CARGO_PKG_VERSION"), ")");
 pub const ENGINE_AUTHOR: &str = "opencode";
 
 pub struct Engine {
@@ -178,6 +178,13 @@ fn handle_command(
         "bench" => {
             let depth = parts.next().and_then(|d| d.parse::<u8>().ok()).unwrap_or(5);
             run_bench(eng, depth);
+        }
+        "dino" => {
+            // DinoChess mascot command: serves the next dinosaur fact as an
+            // `info string` (UCI-legal any time, ignored by GUIs that don't
+            // know it). Feeds the lichess bot's `!dino` chat command.
+            println!("info string {}", crate::dino::next_fact());
+            flush();
         }
         _ => {
             // Unknown commands are ignored per UCI spec ("should" ignore).

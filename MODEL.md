@@ -1,4 +1,4 @@
-# Ferrum Model (cheat-sheet)
+# DinoChess Model (cheat-sheet)
 
 One-line technical reference. Prose and rationale live in `docs.md`;
 contributor rules in `AGENTS.md`; roadmap in `plan.md` (local-only).
@@ -7,6 +7,7 @@ contributor rules in `AGENTS.md`; roadmap in `plan.md` (local-only).
 
 `types` → `board` → `movegen` → `eval` → `search` → `uci` → `main`.
 `bitboard` (attack tables, rays, `pop_lsb`) serves `board`/`movegen`.
+`dino` (mascot facts, `DINO_FACTS` + rotation) serves `uci` (`dino` command).
 
 | File | Owns |
 |---|---|
@@ -17,6 +18,7 @@ contributor rules in `AGENTS.md`; roadmap in `plan.md` (local-only).
 | `eval.rs` | `evaluate()` (White view), tapered PSTs, structure/mobility/shield, `TEMPO` |
 | `search.rs` | `search_root`, `negamax`, `quiescence`, lock-free `TT`, Lazy SMP, `Limits` |
 | `uci.rs` | `Engine`, command loop, `parse_go`, `apply_position`, `BENCH_FENS` |
+| `dino.rs` | `DINO_FACTS` (24), `next_fact()` rotation, `dino` command source |
 
 ## Key constants
 
@@ -52,13 +54,13 @@ Mate scores ply-adjusted (store +, probe −); root stores every iteration
 
 | Check | Expected |
 |---|---|
-| `cargo test` | 49 passed |
+| `cargo test` | 53 passed |
 | `perft 4` startpos | 197281 (~25ms release) |
 | Kiwipete d3 / pos3 / endgame | 97862 / exact / exact (see tests) |
 | `bench 8` | 823,390 nodes, ~575k nps (±8% run noise) |
 | Gates | tapered kept; gravity 32–19–9 (+76 ±92); 200-game attempt exposed EP bug; TT aging neutral (52–48); SEE kept (23–21–16 @40/10, depth-12 Ba6>dxe6 proof); ring-attack kept (96–104 @40/10 neutral, Dragon sensed + Kirin f6 fixed); counter/follow-history kept (97.5–102.5 @40/10 neutral, −4.6% bench nodes, zero anomalies) |
 
-## Test inventory (48)
+## Test inventory (53)
 
 perft: startpos d1–4, Kiwipete (+d4), pos3 deep, endgame, captures-vs-filter
 (+children) · eval: balance/symmetry (mirrored side), queen, passer

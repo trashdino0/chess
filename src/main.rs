@@ -1,5 +1,6 @@
 mod bitboard;
 mod board;
+mod dino;
 mod eval;
 mod movegen;
 mod search;
@@ -8,8 +9,8 @@ mod uci;
 
 fn main() {
     // CLI shortcuts (bypass UCI loop):
-    //   chess-engine perft <depth> [fen]  - run a perft count
-    //   chess-engine bench [depth]        - run a small search benchmark
+    //   dinochess perft <depth> [fen]  - run a perft count
+    //   dinochess bench [depth]        - run a small search benchmark
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         match args[1].as_str() {
@@ -31,7 +32,7 @@ fn main() {
                 return;
             }
             "search" => {
-                // chess-engine search <depth> [fen] — direct search, no UCI loop.
+                // dinochess search <depth> [fen] — direct search, no UCI loop.
                 let depth: u8 = args.get(2).and_then(|d| d.parse().ok()).unwrap_or(5);
                 let fen = args
                     .get(3)

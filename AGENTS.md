@@ -1,7 +1,8 @@
-# AGENTS.md — chess-engine (Ferrum 2.0)
+# AGENTS.md — dinochess (DinoChess)
 
 Rust UCI chess engine. Std-only (zero deps by design — don't add crates).
-`src/`: `types` → `board` → `movegen` → `eval` → `search` → `uci` → `main`.
+`src/`: `types` → `board` → `movegen` → `eval` → `search` → `uci` → `main`
+(`bitboard` serves `board`/`movegen`; `dino` holds mascot facts for `uci`).
 
 ## Toolchain (Windows PowerShell 5.1)
 
@@ -13,11 +14,11 @@ Rust UCI chess engine. Std-only (zero deps by design — don't add crates).
 
 - `cargo test` — perft correctness (startpos d1–4, Kiwipete, endgame) + eval tests.
   Dev profile sets `opt-level = 1` so perft d4 stays fast; don't remove it.
-- `cargo build --release` — GUI binary: `target\release\chess-engine.exe`.
+- `cargo build --release` — GUI binary: `target\release\dinochess.exe`.
 - CLI shortcuts bypass the UCI loop (preferred for testing):
-  `chess-engine.exe perft <depth> [fen]`,
-  `chess-engine.exe search <depth> [fen]`,
-  `chess-engine.exe bench [depth]`.
+  `dinochess.exe perft <depth> [fen]`,
+  `dinochess.exe search <depth> [fen]`,
+  `dinochess.exe bench [depth]`.
 
 ## UCI testing gotcha
 
